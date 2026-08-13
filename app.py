@@ -497,10 +497,19 @@ a.att-file { display: block; margin-top: 4px; font-size: 13px; }
 #sentinel { text-align: center; padding: 16px; color: #999; font-size: 13px; }
 .row.highlight .bubble, .row.highlight img.att, .row.highlight video.att { outline: 3px solid #ffcc00; }
 .searchbox { padding: 5px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; width: 140px; }
-.mediagrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px; }
-.tile { display: block; aspect-ratio: 1; overflow: hidden; border-radius: 8px; background: #e5e5ea; }
+.mediagrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 3px; }
+.tile { display: block; aspect-ratio: 1; overflow: hidden; border-radius: 4px; background: #e5e5ea; }
 .tile img, .tile video { width: 100%; height: 100%; object-fit: cover; }
 .filetile { display: flex; align-items: center; justify-content: center; height: 100%; font-size: 11px; padding: 6px; text-align: center; color: #666; }
+.media-month { margin-bottom: 18px; }
+.media-month-h { font-size: 15px; font-weight: 600; color: #1c1c1e; margin: 0 0 8px 2px; position: sticky; top: 44px; background: #f2f2f7; padding: 6px 0; z-index: 5; }
+.media-rail { position: fixed; right: 4px; top: 70px; bottom: 16px; width: 46px; z-index: 30; display: flex; }
+.media-rail-track { position: relative; flex: 1; cursor: pointer; touch-action: none; }
+.media-rail-tick { position: absolute; right: 6px; transform: translateY(-50%); font-size: 10px; color: #9a9a9a; pointer-events: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.media-rail-dot { position: absolute; right: 2px; width: 5px; height: 5px; border-radius: 50%; background: #0b84ff; transform: translateY(-50%); pointer-events: none; transition: top 0.05s linear; }
+.media-rail-label { position: absolute; right: 100%; margin-right: 10px; transform: translateY(-50%); background: #0b0b0b; color: #fff; font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px; white-space: nowrap; opacity: 0; transition: opacity 0.15s; pointer-events: none; }
+.media-rail.active .media-rail-label { opacity: 1; }
+body.mediapage main { padding-right: 56px; }
 .searchresult { display: block; background: #fff; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; text-decoration: none; color: inherit; }
 .searchresult:hover { background: #f5f8ff; }
 .sr-meta { font-size: 11px; color: #888; margin-bottom: 4px; }
@@ -527,6 +536,9 @@ tr.chatrow td.name { display: flex; align-items: center; gap: 10px; }
 .lbcount { font-size: 12px; color: #52514e; font-variant-numeric: tabular-nums; text-align: right; }
 @keyframes rowIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
 .ccard { display: flex; justify-content: space-between; align-items: center; background: #fff; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; opacity: 0; animation: rowIn 0.4s ease forwards; }
+.lbrow.clickable, .ccard.clickable { cursor: pointer; }
+.lbrow.clickable { margin-left: -8px; margin-right: -8px; padding: 4px 8px; border-radius: 6px; }
+.lbrow.clickable:hover, .ccard.clickable:hover { background: #f5f8ff; }
 .ccard-left { display: flex; align-items: center; gap: 10px; }
 .ccard-name { font-size: 14px; font-weight: 600; color: #0b0b0b; }
 .ccard-sub { font-size: 12px; color: #898781; margin-top: 2px; }
@@ -740,6 +752,89 @@ document.getElementById('datepicker').addEventListener('change', e => {{
 </body></html>"""
 
 
+def month_label(ym):
+    return datetime.strptime(ym, "%Y-%m").strftime("%B %Y")
+
+
+MEDIA_RAIL_SCRIPT = """
+(function() {
+  const sections = Array.from(document.querySelectorAll('.media-month'));
+  const rail = document.getElementById('mediaRail');
+  if (!sections.length || !rail) return;
+  const track = document.getElementById('mediaRailTrack');
+  const dot = document.getElementById('mediaRailDot');
+  const label = document.getElementById('mediaRailLabel');
+  let dragging = false;
+
+  function docHeight() {
+    return Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+  }
+
+  function layoutTicks() {
+    track.querySelectorAll('.media-rail-tick').forEach(t => t.remove());
+    const total = document.documentElement.scrollHeight;
+    let lastYear = null;
+    sections.forEach(sec => {
+      const year = sec.dataset.year;
+      if (year !== lastYear) {
+        lastYear = year;
+        const tick = document.createElement('div');
+        tick.className = 'media-rail-tick';
+        tick.style.top = (sec.offsetTop / total * 100) + '%';
+        tick.textContent = year;
+        track.appendChild(tick);
+      }
+    });
+  }
+
+  function sectionAtFrac(frac) {
+    const targetTop = frac * docHeight();
+    let cur = sections[0];
+    for (const sec of sections) {
+      if (sec.offsetTop <= targetTop + 60) cur = sec; else break;
+    }
+    return cur;
+  }
+
+  function updateDot() {
+    const frac = window.scrollY / docHeight();
+    dot.style.top = (frac * 100) + '%';
+  }
+
+  let ticking = false;
+  window.addEventListener('scroll', () => {
+    if (!ticking) {
+      requestAnimationFrame(() => { updateDot(); ticking = false; });
+      ticking = true;
+    }
+  });
+  window.addEventListener('resize', layoutTicks);
+
+  track.addEventListener('mousemove', e => {
+    const rect = track.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    const sec = sectionAtFrac(frac);
+    label.textContent = sec.dataset.label;
+    label.style.top = (frac * 100) + '%';
+    rail.classList.add('active');
+    if (dragging) window.scrollTo(0, frac * docHeight());
+  });
+  track.addEventListener('mouseleave', () => { if (!dragging) rail.classList.remove('active'); });
+  track.addEventListener('mousedown', e => {
+    dragging = true;
+    const rect = track.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    window.scrollTo(0, frac * docHeight());
+  });
+  window.addEventListener('mouseup', () => { dragging = false; });
+
+  window.addEventListener('load', () => { layoutTicks(); updateDot(); });
+  layoutTicks();
+  updateDot();
+})();
+"""
+
+
 def render_media(chat_id):
     conn = get_conn()
     chat = conn.execute(
@@ -766,8 +861,16 @@ def render_media(chat_id):
     title = chat_label(chat["display_name"], chat["chat_identifier"], participants)
     conn.close()
 
+    sections = []
+    cur_ym = None
     tiles = []
     for a in media:
+        ym = apple_date(a["date"])[:7]
+        if ym != cur_ym:
+            if tiles:
+                sections.append((cur_ym, tiles))
+            cur_ym = ym
+            tiles = []
         mime = a["mime_type"] or mimetypes.guess_type(a["filename"] or "")[0] or ""
         link = f'/chat/{chat_id}?around={a["msg_id"]}'
         if mime.startswith("image/"):
@@ -778,13 +881,30 @@ def render_media(chat_id):
             fname = html.escape(os.path.basename(a["filename"] or "file"))
             inner = f'<div class="filetile">{fname}</div>'
         tiles.append(f'<a class="tile" href="{link}" title="{apple_date(a["date"])}">{inner}</a>')
+    if tiles:
+        sections.append((cur_ym, tiles))
 
-    body = "".join(tiles) if tiles else '<p style="color:#999">No media in this conversation.</p>'
+    if sections:
+        section_html = "".join(
+            f'<section class="media-month" data-year="{ym[:4]}" data-label="{month_label(ym)}">'
+            f'<h3 class="media-month-h">{month_label(ym)}</h3>'
+            f'<div class="mediagrid">{"".join(tile_htmls)}</div></section>'
+            for ym, tile_htmls in sections
+        )
+        rail_html = f"""<div class="media-rail" id="mediaRail">
+<div class="media-rail-track" id="mediaRailTrack"><div class="media-rail-dot" id="mediaRailDot"></div></div>
+<div class="media-rail-label" id="mediaRailLabel"></div>
+</div>"""
+    else:
+        section_html = '<p style="color:#999">No media in this conversation.</p>'
+        rail_html = ""
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Media: {html.escape(title)}</title><style>{PAGE_CSS}</style></head><body>
+<title>Media: {html.escape(title)}</title><style>{PAGE_CSS}</style></head><body class="mediapage">
 <header><a href="/chat/{chat_id}">&larr; {html.escape(title)}</a> <b>Media</b> &middot; {len(media)} items</header>
-<main><div class="mediagrid">{body}</div></main>
+<main>{section_html}</main>
+{rail_html}
+<script>{MEDIA_RAIL_SCRIPT}</script>
 </body></html>"""
 
 
@@ -865,6 +985,28 @@ def apple_to_datetime(ns):
     return datetime.fromtimestamp(ns / 1_000_000_000 + APPLE_EPOCH)
 
 
+def best_chat_per_handle(conn):
+    """Find the chat to open when someone clicks a contact: the direct 1:1
+    chat if one exists, otherwise their highest-volume shared chat."""
+    rows = conn.execute(
+        """SELECT h.id as handle, cmj.chat_id as chat_id,
+                  (SELECT count(*) FROM chat_handle_join x WHERE x.chat_id = cmj.chat_id) as n_participants,
+                  count(*) as msg_count
+           FROM message m
+           JOIN handle h ON h.ROWID = m.handle_id
+           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+           WHERE m.is_from_me = 0
+           GROUP BY h.id, cmj.chat_id"""
+    ).fetchall()
+    best = {}
+    for r in rows:
+        is_dm = r["n_participants"] == 1
+        cur = best.get(r["handle"])
+        if cur is None or (is_dm, r["msg_count"]) > (cur[1], cur[2]):
+            best[r["handle"]] = (r["chat_id"], is_dm, r["msg_count"])
+    return {handle: chat_id for handle, (chat_id, _, _) in best.items()}
+
+
 def compute_contact_stats(conn):
     counts = conn.execute(
         f"""SELECT h.id as handle, count(*) c, min(m.date) as first_d, max(m.date) as last_d
@@ -880,6 +1022,7 @@ def compute_contact_stats(conn):
                GROUP BY h.id"""
         ).fetchall()
     }
+    chat_per_handle = best_chat_per_handle(conn)
 
     now = datetime.now()
     items = []
@@ -891,6 +1034,7 @@ def compute_contact_stats(conn):
                 "name": resolve_contact(r["handle"]) or r["handle"],
                 "count": r["c"],
                 "chat_count": chat_counts.get(r["handle"], 1),
+                "chat_id": chat_per_handle.get(r["handle"]),
                 "first_dt": first_dt,
                 "last_dt": last_dt,
                 "span_days": (last_dt - first_dt).days,
@@ -920,8 +1064,9 @@ def render_leaderboard(items, max_count):
     rows = []
     for i, it in enumerate(items):
         pct = round(it["count"] / max_count * 100, 1) if max_count else 0
+        clickable = ' class="lbrow clickable" onclick="location.href=\'/chat/{}\'"'.format(it["chat_id"]) if it.get("chat_id") else ' class="lbrow"'
         rows.append(
-            f'<div class="lbrow" style="animation-delay:{i * 40}ms">'
+            f'<div{clickable} style="animation-delay:{i * 40}ms">'
             f'<div class="lbname">{avatar_html(it["name"])}{html.escape(it["name"])}</div>'
             f'<div class="lbtrack"><div class="lbbar" data-target="{pct}%"></div></div>'
             f'<div class="lbcount countup" data-count="{it["count"]}">0</div>'
@@ -931,15 +1076,18 @@ def render_leaderboard(items, max_count):
 
 
 def render_contact_cards(items, sub_fn):
-    return "".join(
-        f'<div class="ccard" style="animation-delay:{i * 40}ms">'
-        f'<div class="ccard-left">{avatar_html(it["name"])}'
-        f'<div><div class="ccard-name">{html.escape(it["name"])}</div>'
-        f'<div class="ccard-sub">{sub_fn(it)}</div></div></div>'
-        f'<div class="ccard-count countup" data-count="{it["count"]}">0</div>'
-        f"</div>"
-        for i, it in enumerate(items)
-    )
+    out = []
+    for i, it in enumerate(items):
+        clickable = ' clickable" onclick="location.href=\'/chat/{}\'"'.format(it["chat_id"]) if it.get("chat_id") else '"'
+        out.append(
+            f'<div class="ccard{clickable} style="animation-delay:{i * 40}ms">'
+            f'<div class="ccard-left">{avatar_html(it["name"])}'
+            f'<div><div class="ccard-name">{html.escape(it["name"])}</div>'
+            f'<div class="ccard-sub">{sub_fn(it)}</div></div></div>'
+            f'<div class="ccard-count countup" data-count="{it["count"]}">0</div>'
+            f"</div>"
+        )
+    return "".join(out)
 
 
 def render_trend_chart(monthly):
