@@ -1206,6 +1206,11 @@ def render_voice_section(chat_by_handle):
         f'{html.escape(p["phrase"])}<span class="n">{p["n"]:,}</span></a>'
         for p in voice.get("phrases") or []
     )
+    three_word_phrase_html = "".join(
+        f'<a class="vchip" href="/search?q={html.escape(quote(p["phrase"]), quote=True)}">'
+        f'{html.escape(p["phrase"])}<span class="n">{p["n"]:,}</span></a>'
+        for p in voice.get("three_word_phrases") or []
+    )
     people_html = []
     for p in voice.get("people") or []:
         chips = "".join(
@@ -1237,6 +1242,8 @@ def render_voice_section(chat_by_handle):
 <div class="panel">{render_word_cloud(voice.get("words") or [])}</div>
 <h2 class="section-h">Phrases you reach for</h2>
 <div class="vchips">{phrase_html}</div>
+<h2 class="section-h">Three-word phrases you reach for</h2>
+<div class="vchips">{three_word_phrase_html}</div>
 {people_block}"""
 
 

@@ -23,6 +23,7 @@ SMS_STOP = frozenset(
 MIN_PERSON_MSGS = 80
 TOP_WORDS = 80
 TOP_PHRASES = 20
+TOP_TRIGRAMS = 20
 TOP_PEOPLE = 12
 DISTINCTIVE_PER_PERSON = 12
 
@@ -49,6 +50,16 @@ def _stopwords():
 def _tokenize(text):
     text = URL.sub(" ", (text or "").lower().replace("\u2019", "'"))
     return [t.replace("'", "") for t in TOKEN.findall(text) if t.replace("'", "")]
+
+
+def phrase_counts(tokens, size):
+    counts = Counter()
+    for start in range(len(tokens) - size + 1):
+        phrase = tokens[start : start + size]
+        if any(token in BIGRAM_SKIP or len(token) < 2 for token in phrase):
+            continue
+        counts[" ".join(phrase)] += 1
+    return counts
 
 
 def _name_tokens(name):
@@ -119,6 +130,7 @@ def build_voice_stats(force=False, verbose=False):
     conn.row_factory = sqlite3.Row
     overall = Counter()
     bigrams = Counter()
+    trigrams = Counter()
     per = defaultdict(Counter)
     per_n = Counter()
     n_tokens = 0
@@ -135,12 +147,8 @@ def build_voice_stats(force=False, verbose=False):
             content = [t for t in toks if t not in stop and len(t) >= 2]
             overall.update(content)
             n_tokens += len(content)
-            for a, b in zip(toks, toks[1:]):
-                if a in BIGRAM_SKIP or b in BIGRAM_SKIP:
-                    continue
-                if len(a) < 2 or len(b) < 2:
-                    continue
-                bigrams[a + " " + b] += 1
+            bigrams.update(phrase_counts(toks, 2))
+            trigrams.update(phrase_counts(toks, 3))
             handle = row["handle"] or ""
             if handle:
                 per[handle].update(content)
@@ -155,6 +163,9 @@ def build_voice_stats(force=False, verbose=False):
 
     words = [{"word": w, "n": n} for w, n in overall.most_common(TOP_WORDS)]
     phrases = [{"phrase": p, "n": n} for p, n in bigrams.most_common(TOP_PHRASES)]
+    three_word_phrases = [
+        {"phrase": p, "n": n} for p, n in trigrams.most_common(TOP_TRIGRAMS)
+    ]
 
     people = []
     for handle, msgs in per_n.most_common():
@@ -180,6 +191,7 @@ def build_voice_stats(force=False, verbose=False):
         "avg_len": round(len_sum / n_msgs) if n_msgs else 0,
         "words": words,
         "phrases": phrases,
+        "three_word_phrases": three_word_phrases,
         "people": people,
     }
     tmp = VOICE_CACHE + ".tmp"
