@@ -27,7 +27,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from config import CACHE_CONTROL, CACHE_DIR, DB_PATH, PAGE_SIZE, PORT, START_NEWEST, START_OLDEST, THUMB_SIZE, save_pref
+from config import (
+    CACHE_CONTROL,
+    CACHE_DIR,
+    DB_PATH,
+    PAGE_SIZE,
+    PORT,
+    SCRIPT_DIR,
+    START_NEWEST,
+    START_OLDEST,
+    THUMB_SIZE,
+    save_pref,
+)
 from contacts import AVATAR_INDEX, CONTACTS
 from db import (
     DbUnavailable,
@@ -49,6 +60,11 @@ from render import (
     render_stats,
 )
 from search import ensure_indexes, kick_search_index
+
+STATIC_TYPES = {
+    "app.css": "text/css; charset=utf-8",
+    "app.js": "application/javascript; charset=utf-8",
+}
 
 
 def convert_heic(path):
@@ -107,6 +123,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_pref("start", start)
             sort = qs.get("sort", ["recent"])[0]
             self._send_html(render_chat_list(sort))
+        elif parts[0] == "static" and len(parts) == 2:
+            self._serve_static(parts[1])
         elif parts[0] == "stats" and len(parts) == 1:
             self._send_html(render_stats())
         elif parts[0] == "search" and len(parts) == 1:
@@ -242,7 +260,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.end_headers()
 
-    def _send_file(self, path, mime):
+    def _serve_static(self, name):
+        mime = STATIC_TYPES.get(name)
+        if not mime:
+            self._send_error(404)
+            return
+        self._send_file(os.path.join(SCRIPT_DIR, "static", name), mime, cache="no-cache")
+
+    def _send_file(self, path, mime, cache=CACHE_CONTROL):
         try:
             size = os.path.getsize(path)
             handle = open(path, "rb")
@@ -252,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(size))
-        self.send_header("Cache-Control", CACHE_CONTROL)
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         try:
             shutil.copyfileobj(handle, self.wfile, 65536)
