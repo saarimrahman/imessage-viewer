@@ -296,9 +296,11 @@ def ensure_indexes(force=False):
 
 
 def _search_match(conn, match, chat_id, limit):
+    # FTS5 MATCH needs the real table name on the left. An alias like
+    # `docs_fts f ... WHERE f MATCH ?` raises "no such column: f".
     sql = """SELECT d.msg_id, d.chat_id, d.date, d.is_from_me, d.handle, d.body
-             FROM docs_fts f JOIN docs d ON d.id = f.rowid
-             WHERE f MATCH ?"""
+             FROM docs_fts JOIN docs d ON d.id = docs_fts.rowid
+             WHERE docs_fts MATCH ?"""
     params = [match]
     if chat_id is not None:
         sql += " AND d.chat_id = ?"
