@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import hashlib
@@ -24,7 +25,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
 PORT = 8765
 PAGE_SIZE = 150
+THUMB_SIZE = 512
 APPLE_EPOCH = 978307200  # 2001-01-01 relative to Unix epoch
+CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -156,6 +159,26 @@ def convert_heic(path):
     return out_path
 
 
+def make_thumb(path):
+    """Max-edge 512px JPEG for chat bubbles and the media grid. Lightbox still
+    uses the original via /attachment."""
+    digest = hashlib.sha1(f"thumb{THUMB_SIZE}:{path}".encode()).hexdigest()
+    out_path = os.path.join(CACHE_DIR, digest + ".jpg")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    result = subprocess.run(
+        ["sips", "-Z", str(THUMB_SIZE), "-s", "format", "jpeg", path, "--out", out_path],
+        capture_output=True,
+    )
+    if result.returncode != 0 or not os.path.exists(out_path):
+        return None
+    return out_path
+
+
+def is_heic(path, mime):
+    return mime in ("image/heic", "image/heif") or path.lower().endswith((".heic", ".heif"))
+
+
 # ---------- Contacts ----------
 
 def normalize_phone(s):
@@ -285,25 +308,59 @@ def chat_label(display_name, identifier, participants):
 
 # ---------- Messages ----------
 
-def fetch_messages(conn, chat_id, after_rowid=None, start_ns=None, limit=PAGE_SIZE):
+MSG_SELECT = """SELECT m.ROWID as id, m.guid, m.text, m.attributedBody, m.date, m.is_from_me, h.id as handle
+            FROM message m
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            LEFT JOIN handle h ON h.ROWID = m.handle_id"""
+
+
+def fetch_messages(conn, chat_id, after=None, before=None, start_ns=None, limit=PAGE_SIZE):
+    """Page by (date, ROWID). `after`/`before` are (date_ns, rowid) cursors."""
     where = ["cmj.chat_id=?", REACTION_EXCLUDE_SQL]
     params = [chat_id]
-    if after_rowid:
-        where.append("m.ROWID > ?")
-        params.append(after_rowid)
+    order = "m.date ASC, m.ROWID ASC"
+    if after:
+        date_ns, rowid = after
+        where.append("(m.date > ? OR (m.date = ? AND m.ROWID > ?))")
+        params.extend([date_ns, date_ns, rowid])
+    elif before:
+        date_ns, rowid = before
+        where.append("(m.date < ? OR (m.date = ? AND m.ROWID < ?))")
+        params.extend([date_ns, date_ns, rowid])
+        order = "m.date DESC, m.ROWID DESC"
     elif start_ns is not None:
         where.append("m.date >= ?")
         params.append(start_ns)
-    return conn.execute(
-        f"""SELECT m.ROWID as id, m.guid, m.text, m.attributedBody, m.date, m.is_from_me, h.id as handle
-            FROM message m
-            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-            LEFT JOIN handle h ON h.ROWID = m.handle_id
-            WHERE {' AND '.join(where)}
-            ORDER BY m.date ASC
-            LIMIT ?""",
+    rows = conn.execute(
+        f"{MSG_SELECT} WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?",
         params + [limit],
     ).fetchall()
+    if before:
+        rows = list(reversed(rows))
+    return rows
+
+
+def sender_context(conn, rowid):
+    r = conn.execute(
+        """SELECT m.date, m.is_from_me, h.id as handle FROM message m
+           LEFT JOIN handle h ON h.ROWID = m.handle_id WHERE m.ROWID=?""",
+        (rowid,),
+    ).fetchone()
+    if not r:
+        return None, None
+    return apple_date(r["date"])[:10], (r["is_from_me"], r["handle"])
+
+
+def has_neighbor(conn, chat_id, date_ns, rowid, direction):
+    if direction == "before":
+        clause = "(m.date < ? OR (m.date = ? AND m.ROWID < ?))"
+    else:
+        clause = "(m.date > ? OR (m.date = ? AND m.ROWID > ?))"
+    return conn.execute(
+        f"""SELECT 1 FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            WHERE cmj.chat_id=? AND {REACTION_EXCLUDE_SQL} AND {clause} LIMIT 1""",
+        (chat_id, date_ns, date_ns, rowid),
+    ).fetchone() is not None
 
 
 def load_attachments(conn, message_ids):
@@ -321,11 +378,18 @@ def load_attachments(conn, message_ids):
     return out
 
 
-def render_message_blocks(rows, att_by_msg, reactions_by_guid=None, highlight_id=None):
+def render_message_blocks(
+    rows,
+    att_by_msg,
+    reactions_by_guid=None,
+    highlight_id=None,
+    prev_day=None,
+    prev_sender=None,
+    next_day=None,
+    next_sender=None,
+):
     reactions_by_guid = reactions_by_guid or {}
     blocks = []
-    prev_day = None
-    prev_sender = None
     n = len(rows)
 
     for idx, r in enumerate(rows):
@@ -333,16 +397,21 @@ def render_message_blocks(rows, att_by_msg, reactions_by_guid=None, highlight_id
         sender_key = (r["is_from_me"], r["handle"])
 
         if day != prev_day:
-            blocks.append(f'<div class="dateSep">{format_day_label(day)}</div>')
+            if next_day is None or day != next_day:
+                blocks.append(f'<div class="dateSep">{format_day_label(day)}</div>')
             prev_day = day
             prev_sender = None
 
         next_row = rows[idx + 1] if idx + 1 < n else None
-        next_same_group = (
-            next_row is not None
-            and (next_row["is_from_me"], next_row["handle"]) == sender_key
-            and apple_date(next_row["date"])[:10] == day
-        )
+        if next_row is not None:
+            next_same_group = (
+                (next_row["is_from_me"], next_row["handle"]) == sender_key
+                and apple_date(next_row["date"])[:10] == day
+            )
+        elif next_sender is not None:
+            next_same_group = next_sender == sender_key and next_day == day
+        else:
+            next_same_group = False
         is_last_in_group = not next_same_group
         is_first_in_group = sender_key != prev_sender
 
@@ -365,9 +434,12 @@ def render_message_blocks(rows, att_by_msg, reactions_by_guid=None, highlight_id
         for a in att_by_msg.get(r["id"], []):
             mime = a["mime_type"] or mimetypes.guess_type(a["filename"] or "")[0] or ""
             if mime.startswith("image/"):
-                body += f'<img class="att" src="/attachment/{a["att_id"]}" loading="lazy">'
+                body += (
+                    f'<img class="att" src="/thumb/{a["att_id"]}" '
+                    f'data-full-src="/attachment/{a["att_id"]}" loading="lazy" data-msg-id="{r["id"]}">'
+                )
             elif mime.startswith("video/"):
-                body += f'<video class="att" src="/attachment/{a["att_id"]}" controls></video>'
+                body += f'<video class="att" src="/attachment/{a["att_id"]}" controls data-msg-id="{r["id"]}"></video>'
             else:
                 fname = html.escape(os.path.basename(a["filename"] or "file"))
                 body += f'<a class="att-file" href="/attachment/{a["att_id"]}">{fname}</a>'
@@ -391,23 +463,21 @@ def render_message_blocks(rows, att_by_msg, reactions_by_guid=None, highlight_id
 
 
 def fetch_messages_around(conn, chat_id, target_id, half=75):
+    target = conn.execute("SELECT date FROM message WHERE ROWID=?", (target_id,)).fetchone()
+    if not target:
+        return []
+    tgt_date = target["date"]
     before_rows = conn.execute(
-        f"""SELECT m.ROWID as id, m.guid, m.text, m.attributedBody, m.date, m.is_from_me, h.id as handle
-           FROM message m
-           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-           LEFT JOIN handle h ON h.ROWID = m.handle_id
-           WHERE cmj.chat_id=? AND m.ROWID <= ? AND {REACTION_EXCLUDE_SQL}
-           ORDER BY m.date DESC LIMIT ?""",
-        (chat_id, target_id, half),
+        f"""{MSG_SELECT}
+           WHERE cmj.chat_id=? AND (m.date < ? OR (m.date = ? AND m.ROWID <= ?)) AND {REACTION_EXCLUDE_SQL}
+           ORDER BY m.date DESC, m.ROWID DESC LIMIT ?""",
+        (chat_id, tgt_date, tgt_date, target_id, half),
     ).fetchall()
     after_rows = conn.execute(
-        f"""SELECT m.ROWID as id, m.guid, m.text, m.attributedBody, m.date, m.is_from_me, h.id as handle
-           FROM message m
-           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-           LEFT JOIN handle h ON h.ROWID = m.handle_id
-           WHERE cmj.chat_id=? AND m.ROWID > ? AND {REACTION_EXCLUDE_SQL}
-           ORDER BY m.date ASC LIMIT ?""",
-        (chat_id, target_id, half),
+        f"""{MSG_SELECT}
+           WHERE cmj.chat_id=? AND (m.date > ? OR (m.date = ? AND m.ROWID > ?)) AND {REACTION_EXCLUDE_SQL}
+           ORDER BY m.date ASC, m.ROWID ASC LIMIT ?""",
+        (chat_id, tgt_date, tgt_date, target_id, half),
     ).fetchall()
     return list(reversed(before_rows)) + list(after_rows)
 
@@ -532,9 +602,9 @@ body.chatpage { background: #fff; }
 .ts { font-size: 10px; color: #aaa; margin: 3px 10px 0; }
 .dateSep { align-self: center; font-size: 12px; color: #888; padding: 4px 12px; margin: 16px 0 6px; }
 .reaction-pill { font-size: 11px; background: rgba(0,0,0,0.06); color: #555; padding: 2px 9px; border-radius: 10px; margin-top: 4px; display: inline-block; }
-img.att { max-width: 280px; max-height: 280px; border-radius: 16px; display: block; margin-top: 4px; }
+img.att, video.att { max-width: 280px; max-height: 280px; border-radius: 16px; display: block; margin-top: 4px; }
 a.att-file { display: block; margin-top: 4px; font-size: 13px; }
-#sentinel { text-align: center; padding: 16px; color: #999; font-size: 13px; }
+#sentinel, #sentinel-top { text-align: center; padding: 16px; color: #999; font-size: 13px; min-height: 1px; }
 .row.highlight .bubble, .row.highlight img.att, .row.highlight video.att { outline: 3px solid #ffcc00; }
 .searchbox { padding: 5px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; width: 140px; }
 .mediagrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 3px; }
@@ -549,7 +619,7 @@ a.att-file { display: block; margin-top: 4px; font-size: 13px; }
 .media-rail-dot { position: absolute; right: 2px; width: 5px; height: 5px; border-radius: 50%; background: #0b84ff; transform: translateY(-50%); pointer-events: none; transition: top 0.05s linear; }
 .media-rail-label { position: absolute; right: 100%; margin-right: 10px; transform: translateY(-50%); background: #0b0b0b; color: #fff; font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px; white-space: nowrap; opacity: 0; transition: opacity 0.15s; pointer-events: none; }
 .media-rail.active .media-rail-label { opacity: 1; }
-body.mediapage main { padding-right: 56px; }
+body.mediapage main, body.chatpage main { padding-right: 56px; }
 .searchresult { display: block; background: #fff; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; text-decoration: none; color: inherit; }
 .searchresult:hover { background: #f5f8ff; }
 .sr-meta { font-size: 11px; color: #888; margin-bottom: 4px; }
@@ -592,6 +662,20 @@ tr.chatrow td.name { display: flex; align-items: center; gap: 10px; }
 .pt { fill: #2a78d6; stroke: #fff; stroke-width: 2; }
 .hitcol { fill: transparent; cursor: crosshair; }
 .trendtip { position: absolute; pointer-events: none; background: #0b0b0b; color: #fff; font-size: 11px; padding: 4px 8px; border-radius: 6px; opacity: 0; transform: translate(-50%,-130%); white-space: nowrap; transition: opacity 0.1s; }
+img.att, .tile img, .tile video { cursor: pointer; }
+.lightbox-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 1000; display: none; align-items: center; justify-content: center; }
+.lightbox-overlay.open { display: flex; }
+.lightbox-content { max-width: 92vw; max-height: 92vh; display: flex; align-items: center; justify-content: center; }
+.lightbox-content img, .lightbox-content video { max-width: 92vw; max-height: 92vh; object-fit: contain; border-radius: 6px; }
+.lightbox-close { position: absolute; top: 18px; right: 24px; color: #fff; font-size: 30px; cursor: pointer; background: none; border: none; line-height: 1; padding: 4px 10px; }
+.lightbox-nav { position: absolute; top: 50%; transform: translateY(-50%); color: #fff; font-size: 26px; background: rgba(255,255,255,0.1); border: none; width: 44px; height: 44px; border-radius: 50%; cursor: pointer; }
+.lightbox-nav:hover { background: rgba(255,255,255,0.2); }
+.lightbox-prev { left: 18px; }
+.lightbox-next { right: 18px; }
+.ctx-menu { position: fixed; background: #fff; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.25); padding: 4px; z-index: 1100; min-width: 150px; display: none; }
+.ctx-menu.open { display: block; }
+.ctx-menu-item { padding: 8px 12px; font-size: 13px; cursor: pointer; border-radius: 5px; }
+.ctx-menu-item:hover { background: #f2f2f7; }
 """
 
 
@@ -620,6 +704,11 @@ def render_chat_list(sort="recent"):
     participants_map = load_participants(conn, need_participants)
     conn.close()
 
+    def is_known(display_name, chat_identifier, participants):
+        if display_name or resolve_contact(chat_identifier):
+            return True
+        return bool(participants) and any(resolve_contact(p) for p in participants)
+
     items = [
         {
             "id": r["id"],
@@ -628,6 +717,7 @@ def render_chat_list(sort="recent"):
             "count": r["msg_count"],
             "last": r["last_date"],
             "first": r["first_date"],
+            "known": is_known(r["display_name"], r["chat_identifier"], participants_map.get(r["id"])),
         }
         for r in rows
     ]
@@ -646,7 +736,7 @@ def render_chat_list(sort="recent"):
     for it in items:
         trs.append(
             f'<tr class="chatrow" onclick="location.href=\'/chat/{it["id"]}\'" '
-            f'data-search="{html.escape(it["name"].lower())}">'
+            f'data-search="{html.escape(it["name"].lower())}" data-known="{"1" if it["known"] else "0"}">'
             f'<td class="name">{avatar_html(it["name"], it["identifier"])}{html.escape(it["name"])}</td>'
             f'<td class="count">{it["count"]}</td>'
             f'<td class="last">{apple_date(it["last"])}</td>'
@@ -666,13 +756,19 @@ def render_chat_list(sort="recent"):
 </header>
 <main>
 <input id="filter" placeholder="Filter conversations..." oninput="filterRows()">
+<label style="display:flex; align-items:center; gap:6px; font-size:13px; color:#555; margin:-6px 0 12px;">
+<input type="checkbox" id="knownOnly" onchange="filterRows()"> Known contacts only
+</label>
 <table><tbody id="rows">{''.join(trs)}</tbody></table>
 </main>
 <script>
 function filterRows() {{
   const q = document.getElementById('filter').value.toLowerCase();
+  const knownOnly = document.getElementById('knownOnly').checked;
   document.querySelectorAll('#rows tr').forEach(tr => {{
-    tr.style.display = tr.dataset.search.includes(q) ? '' : 'none';
+    const matchesText = tr.dataset.search.includes(q);
+    const matchesKnown = !knownOnly || tr.dataset.known === '1';
+    tr.style.display = matchesText && matchesKnown ? '' : 'none';
   }});
 }}
 </script>
@@ -703,7 +799,6 @@ def render_chat(chat_id, date_str=None, around_id=None):
 
     if around_id:
         rows = fetch_messages_around(conn, chat_id, around_id)
-        has_more = True
     else:
         start_ns = None
         if date_str:
@@ -712,13 +807,16 @@ def render_chat(chat_id, date_str=None, around_id=None):
             except ValueError:
                 start_ns = None
         rows = fetch_messages(conn, chat_id, start_ns=start_ns, limit=PAGE_SIZE)
-        has_more = len(rows) == PAGE_SIZE
 
     ids = [r["id"] for r in rows]
     att_by_msg = load_attachments(conn, ids)
     reactions_by_guid = load_reactions(conn, chat_id, [r["guid"] for r in rows])
     blocks_html = render_message_blocks(rows, att_by_msg, reactions_by_guid, highlight_id=around_id)
-    heatmap_html = build_heatmap_html(conn, chat_id)
+
+    has_older = has_newer = False
+    if rows:
+        has_older = has_neighbor(conn, chat_id, rows[0]["date"], rows[0]["id"], "before")
+        has_newer = has_neighbor(conn, chat_id, rows[-1]["date"], rows[-1]["id"], "after")
 
     participants = None
     if not chat["display_name"] and not resolve_contact(chat["chat_identifier"]):
@@ -726,21 +824,31 @@ def render_chat(chat_id, date_str=None, around_id=None):
     title = chat_label(chat["display_name"], chat["chat_identifier"], participants)
     conn.close()
 
+    first_id = rows[0]["id"] if rows else 0
+    first_date = str(rows[0]["date"]) if rows else "0"
     last_id = rows[-1]["id"] if rows else 0
+    last_date = str(rows[-1]["date"]) if rows else "0"
     min_date = apple_date(bounds["lo"])[:10] if bounds["lo"] else ""
     max_date = apple_date(bounds["hi"])[:10] if bounds["hi"] else ""
-    cur_date = date_str or min_date
+    if around_id and rows:
+        around_row = next((r for r in rows if r["id"] == around_id), rows[0])
+        cur_date = apple_date(around_row["date"])[:10]
+    elif date_str:
+        cur_date = date_str
+    else:
+        cur_date = min_date
 
-    scroll_script = ""
-    if around_id:
-        scroll_script = f"""
-window.addEventListener('DOMContentLoaded', () => {{
-  const el = document.getElementById('msg-{around_id}');
-  if (el) {{
-    el.scrollIntoView({{block: 'center'}});
-    setTimeout(() => el.classList.remove('highlight'), 3000);
-  }}
-}});"""
+    around_js = json.dumps(around_id)
+    top_label = "" if has_older else "Beginning of conversation"
+    bottom_label = "Loading more..." if has_newer else "End of conversation"
+    rail_html = ""
+    rail_script = ""
+    if min_date and max_date:
+        rail_html = """<div class="media-rail" id="chatRail">
+<div class="media-rail-track" id="chatRailTrack"><div class="media-rail-dot" id="chatRailDot"></div></div>
+<div class="media-rail-label" id="chatRailLabel"></div>
+</div>"""
+        rail_script = f"<script>{chat_rail_script(chat_id, min_date, max_date, cur_date)}</script>"
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>{html.escape(title)}</title><style>{PAGE_CSS}</style></head><body class="chatpage">
@@ -757,41 +865,111 @@ window.addEventListener('DOMContentLoaded', () => {{
 </span>
 </header>
 <main>
-{heatmap_html}
+<div id="sentinel-top">{top_label}</div>
 <div class="bubblewrap" id="messages">{blocks_html}</div>
-<div id="sentinel">{"Loading more..." if has_more else "Beginning of visible history" if not date_str and not around_id else ""}</div>
+<div id="sentinel">{bottom_label}</div>
 </main>
+{rail_html}
 <script>
+let firstDate = {json.dumps(first_date)};
+let firstId = {first_id};
+let lastDate = {json.dumps(last_date)};
 let lastId = {last_id};
-let done = {json.dumps(not has_more)};
+let hasOlder = {json.dumps(has_older)};
+let hasNewer = {json.dumps(has_newer)};
 let loading = false;
 const chatId = {chat_id};
+const aroundId = {around_js};
+const topSentinel = document.getElementById('sentinel-top');
 const sentinel = document.getElementById('sentinel');
+const wrap = document.getElementById('messages');
 
-const observer = new IntersectionObserver(entries => {{
-  if (entries[0].isIntersecting) loadMore();
+const olderObs = new IntersectionObserver(entries => {{
+  if (entries[0].isIntersecting) loadOlder();
 }}, {{rootMargin: '600px'}});
-observer.observe(sentinel);
+const newerObs = new IntersectionObserver(entries => {{
+  if (entries[0].isIntersecting) loadNewer();
+}}, {{rootMargin: '600px'}});
 
-async function loadMore() {{
-  if (loading || done) return;
+function armObservers() {{
+  if (hasOlder) olderObs.observe(topSentinel);
+  if (hasNewer) newerObs.observe(sentinel);
+}}
+
+function isNear(el) {{
+  const r = el.getBoundingClientRect();
+  return r.top < window.innerHeight + 600 && r.bottom > -600;
+}}
+function fillIfNeeded() {{
+  if (hasNewer && isNear(sentinel)) loadNewer();
+  else if (hasOlder && isNear(topSentinel)) loadOlder();
+}}
+
+async function loadNewer() {{
+  if (loading || !hasNewer) return;
   loading = true;
-  const res = await fetch(`/chat/${{chatId}}/more?after=${{lastId}}`);
+  const res = await fetch(`/chat/${{chatId}}/more?after_date=${{lastDate}}&after_id=${{lastId}}`);
   const data = await res.json();
   if (data.html) {{
-    document.getElementById('messages').insertAdjacentHTML('beforeend', data.html);
+    wrap.insertAdjacentHTML('beforeend', data.html);
+    lastDate = data.last_date;
     lastId = data.last_id;
   }}
-  done = !data.has_more;
+  hasNewer = data.has_more_newer;
   loading = false;
-  sentinel.textContent = done ? 'End of conversation' : 'Loading more...';
+  sentinel.textContent = hasNewer ? 'Loading more...' : 'End of conversation';
+  if (!hasNewer) newerObs.unobserve(sentinel);
+  fillIfNeeded();
+}}
+
+async function loadOlder() {{
+  if (loading || !hasOlder) return;
+  loading = true;
+  const cursorId = firstId;
+  const prevHeight = document.documentElement.scrollHeight;
+  const prevScroll = window.scrollY;
+  const res = await fetch(`/chat/${{chatId}}/more?before_date=${{firstDate}}&before_id=${{firstId}}`);
+  const data = await res.json();
+  if (data.html) {{
+    wrap.insertAdjacentHTML('afterbegin', data.html);
+    firstDate = data.first_date;
+    firstId = data.first_id;
+    if (data.strip_group_start) {{
+      const el = document.getElementById('msg-' + cursorId);
+      if (el) {{
+        el.classList.remove('group-start');
+        const sender = el.querySelector('.sender');
+        if (sender) sender.remove();
+      }}
+    }}
+    window.scrollTo(0, prevScroll + (document.documentElement.scrollHeight - prevHeight));
+  }}
+  hasOlder = data.has_more_older;
+  loading = false;
+  topSentinel.textContent = hasOlder ? '' : 'Beginning of conversation';
+  if (!hasOlder) olderObs.unobserve(topSentinel);
+  fillIfNeeded();
 }}
 
 document.getElementById('datepicker').addEventListener('change', e => {{
   if (e.target.value) location.href = `/chat/${{chatId}}?date=${{e.target.value}}`;
 }});
-{scroll_script}
+
+if (aroundId) {{
+  window.addEventListener('DOMContentLoaded', () => {{
+    const el = document.getElementById('msg-' + aroundId);
+    if (el) {{
+      el.scrollIntoView({{block: 'center'}});
+      setTimeout(() => el.classList.remove('highlight'), 3000);
+    }}
+    requestAnimationFrame(() => requestAnimationFrame(armObservers));
+  }});
+}} else {{
+  armObservers();
+}}
 </script>
+<script>{lightbox_script(chat_id)}</script>
+{rail_script}
 </body></html>"""
 
 
@@ -878,6 +1056,174 @@ MEDIA_RAIL_SCRIPT = """
 """
 
 
+def chat_rail_script(chat_id, min_date, max_date, cur_date):
+    """Year scrubber mapped to the conversation's date range. Click/drag jumps
+    to that day; the dot marks the current window, not page scroll."""
+    return f"""
+(function() {{
+  const rail = document.getElementById('chatRail');
+  if (!rail) return;
+  const track = document.getElementById('chatRailTrack');
+  const dot = document.getElementById('chatRailDot');
+  const label = document.getElementById('chatRailLabel');
+  const chatId = {chat_id};
+  const curDate = {json.dumps(cur_date)};
+  const t0 = Date.parse({json.dumps(min_date)} + 'T00:00:00');
+  const t1 = Date.parse({json.dumps(max_date)} + 'T00:00:00');
+  const span = Math.max(1, t1 - t0);
+  let dragging = false;
+  let lastFrac = 0;
+
+  function fracOf(dateStr) {{
+    return Math.min(1, Math.max(0, (Date.parse(dateStr + 'T00:00:00') - t0) / span));
+  }}
+  function dateAt(frac) {{
+    const d = new Date(t0 + frac * span);
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return d.getFullYear() + '-' + m + '-' + day;
+  }}
+  const startYear = new Date(t0).getFullYear();
+  const endYear = new Date(t1).getFullYear();
+  for (let y = startYear; y <= endYear; y++) {{
+    const frac = fracOf(y + '-01-01');
+    const tick = document.createElement('div');
+    tick.className = 'media-rail-tick';
+    tick.style.top = (frac * 100) + '%';
+    tick.textContent = y;
+    track.appendChild(tick);
+  }}
+
+  function setDot(frac) {{
+    dot.style.top = (frac * 100) + '%';
+  }}
+  function showLabel(frac) {{
+    lastFrac = frac;
+    label.textContent = dateAt(frac);
+    label.style.top = (frac * 100) + '%';
+    rail.classList.add('active');
+  }}
+  function fracFromEvent(e) {{
+    const rect = track.getBoundingClientRect();
+    return Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+  }}
+
+  setDot(fracOf(curDate));
+
+  track.addEventListener('mousemove', e => {{
+    const frac = fracFromEvent(e);
+    showLabel(frac);
+  }});
+  track.addEventListener('mouseleave', () => {{ if (!dragging) rail.classList.remove('active'); }});
+  track.addEventListener('mousedown', e => {{
+    dragging = true;
+    showLabel(fracFromEvent(e));
+    e.preventDefault();
+  }});
+  window.addEventListener('mouseup', () => {{
+    if (!dragging) return;
+    dragging = false;
+    rail.classList.remove('active');
+    const next = dateAt(lastFrac);
+    if (next !== curDate) location.href = '/chat/' + chatId + '?date=' + next;
+  }});
+}})();
+"""
+
+
+def lightbox_script(chat_id):
+    return f"""
+(function() {{
+  const chatId = {chat_id};
+  const SELECTOR = '.tile, img.att, video.att';
+
+  function mediaInfo(el) {{
+    const inner = el.classList.contains('tile') ? el.querySelector('img,video') : el;
+    if (!inner) return null;
+    return {{ src: inner.getAttribute('data-full-src') || el.getAttribute('data-full-src') || inner.getAttribute('src'), isVideo: inner.tagName === 'VIDEO', msgId: el.dataset.msgId, node: el }};
+  }}
+
+  function collectItems() {{
+    return Array.from(document.querySelectorAll(SELECTOR)).map(mediaInfo).filter(Boolean);
+  }}
+
+  const overlay = document.createElement('div');
+  overlay.className = 'lightbox-overlay';
+  overlay.innerHTML =
+    '<button class="lightbox-close" aria-label="Close">&times;</button>' +
+    '<button class="lightbox-nav lightbox-prev" aria-label="Previous">&#8249;</button>' +
+    '<div class="lightbox-content"></div>' +
+    '<button class="lightbox-nav lightbox-next" aria-label="Next">&#8250;</button>';
+  document.body.appendChild(overlay);
+  const content = overlay.querySelector('.lightbox-content');
+
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.innerHTML = '<div class="ctx-menu-item" id="ctxShowInChat">Show in chat</div>';
+  document.body.appendChild(menu);
+  let menuMsgId = null;
+  let items = [];
+  let curIndex = 0;
+
+  function render(i) {{
+    curIndex = (i + items.length) % items.length;
+    const it = items[curIndex];
+    content.innerHTML = it.isVideo
+      ? `<video src="${{it.src}}" controls autoplay></video>`
+      : `<img src="${{it.src}}">`;
+  }}
+
+  function openAt(node) {{
+    items = collectItems();
+    const idx = items.findIndex(it => it.node === node);
+    if (idx === -1) return;
+    render(idx);
+    overlay.classList.add('open');
+  }}
+
+  function close() {{
+    overlay.classList.remove('open');
+    content.innerHTML = '';
+  }}
+
+  overlay.querySelector('.lightbox-close').addEventListener('click', close);
+  overlay.addEventListener('click', e => {{ if (e.target === overlay) close(); }});
+  overlay.querySelector('.lightbox-prev').addEventListener('click', () => render(curIndex - 1));
+  overlay.querySelector('.lightbox-next').addEventListener('click', () => render(curIndex + 1));
+  document.addEventListener('keydown', e => {{
+    if (!overlay.classList.contains('open')) return;
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowLeft') render(curIndex - 1);
+    else if (e.key === 'ArrowRight') render(curIndex + 1);
+  }});
+
+  document.body.addEventListener('click', e => {{
+    const el = e.target.closest(SELECTOR);
+    if (!el || !mediaInfo(el)) return;
+    e.preventDefault();
+    openAt(el);
+  }});
+
+  document.body.addEventListener('contextmenu', e => {{
+    const el = e.target.closest(SELECTOR);
+    if (!el || !mediaInfo(el)) return;
+    e.preventDefault();
+    menuMsgId = el.dataset.msgId;
+    menu.style.left = e.clientX + 'px';
+    menu.style.top = e.clientY + 'px';
+    menu.classList.add('open');
+  }});
+
+  document.getElementById('ctxShowInChat').addEventListener('click', () => {{
+    if (menuMsgId) location.href = '/chat/' + chatId + '?around=' + menuMsgId;
+  }});
+  document.addEventListener('click', e => {{
+    if (!menu.contains(e.target)) menu.classList.remove('open');
+  }});
+}})();
+"""
+
+
 def render_media(chat_id):
     conn = get_conn()
     chat = conn.execute(
@@ -917,13 +1263,13 @@ def render_media(chat_id):
         mime = a["mime_type"] or mimetypes.guess_type(a["filename"] or "")[0] or ""
         link = f'/chat/{chat_id}?around={a["msg_id"]}'
         if mime.startswith("image/"):
-            inner = f'<img src="/attachment/{a["att_id"]}" loading="lazy">'
+            inner = f'<img src="/thumb/{a["att_id"]}" data-full-src="/attachment/{a["att_id"]}" loading="lazy">'
         elif mime.startswith("video/"):
             inner = f'<video src="/attachment/{a["att_id"]}" preload="metadata" muted></video>'
         else:
             fname = html.escape(os.path.basename(a["filename"] or "file"))
             inner = f'<div class="filetile">{fname}</div>'
-        tiles.append(f'<a class="tile" href="{link}" title="{apple_date(a["date"])}">{inner}</a>')
+        tiles.append(f'<a class="tile" href="{link}" title="{apple_date(a["date"])}" data-msg-id="{a["msg_id"]}">{inner}</a>')
     if tiles:
         sections.append((cur_ym, tiles))
 
@@ -948,6 +1294,7 @@ def render_media(chat_id):
 <main>{section_html}</main>
 {rail_html}
 <script>{MEDIA_RAIL_SCRIPT}</script>
+<script>{lightbox_script(chat_id)}</script>
 </body></html>"""
 
 
@@ -1362,6 +1709,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(out) if out is not None else self._send_error(404)
         elif parts[0] == "attachment" and len(parts) == 2:
             self._serve_attachment(parts[1])
+        elif parts[0] == "thumb" and len(parts) == 2:
+            self._serve_thumb(parts[1])
         elif parts[0] == "avatar" and len(parts) == 2:
             self._serve_avatar(parts[1])
         else:
@@ -1370,20 +1719,70 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_more(self, chat_id, qs):
         try:
             chat_id = int(chat_id)
-            after = int(qs.get("after", [0])[0])
         except ValueError:
             self._send_error(404)
             return
+
+        def take(key):
+            raw = qs.get(key, [None])[0]
+            if raw in (None, ""):
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+
+        after_date, after_id = take("after_date"), take("after_id")
+        before_date, before_id = take("before_date"), take("before_id")
         conn = get_conn()
-        rows = fetch_messages(conn, chat_id, after_rowid=after, limit=PAGE_SIZE)
+        prev_day = prev_sender = next_day = next_sender = None
+        strip_group_start = False
+
+        if before_date is not None and before_id is not None:
+            rows = fetch_messages(conn, chat_id, before=(before_date, before_id), limit=PAGE_SIZE)
+            next_day, next_sender = sender_context(conn, before_id)
+            has_more_older = len(rows) == PAGE_SIZE
+            has_more_newer = True
+            if rows and next_sender is not None:
+                last = rows[-1]
+                strip_group_start = (
+                    apple_date(last["date"])[:10] == next_day
+                    and (last["is_from_me"], last["handle"]) == next_sender
+                )
+        elif after_date is not None and after_id is not None:
+            rows = fetch_messages(conn, chat_id, after=(after_date, after_id), limit=PAGE_SIZE)
+            prev_day, prev_sender = sender_context(conn, after_id)
+            has_more_newer = len(rows) == PAGE_SIZE
+            has_more_older = True
+        else:
+            conn.close()
+            self._send_error(404)
+            return
+
         ids = [r["id"] for r in rows]
         att_by_msg = load_attachments(conn, ids)
         reactions_by_guid = load_reactions(conn, chat_id, [r["guid"] for r in rows])
-        blocks_html = render_message_blocks(rows, att_by_msg, reactions_by_guid)
+        blocks_html = render_message_blocks(
+            rows,
+            att_by_msg,
+            reactions_by_guid,
+            prev_day=prev_day,
+            prev_sender=prev_sender,
+            next_day=next_day,
+            next_sender=next_sender,
+        )
         conn.close()
-        last_id = rows[-1]["id"] if rows else after
         self._send_json(
-            {"html": blocks_html, "last_id": last_id, "has_more": len(rows) == PAGE_SIZE}
+            {
+                "html": blocks_html,
+                "first_id": rows[0]["id"] if rows else 0,
+                "first_date": str(rows[0]["date"]) if rows else "0",
+                "last_id": rows[-1]["id"] if rows else 0,
+                "last_date": str(rows[-1]["date"]) if rows else "0",
+                "has_more_older": has_more_older,
+                "has_more_newer": has_more_newer,
+                "strip_group_start": strip_group_start,
+            }
         )
 
     def _send_html(self, body):
@@ -1406,6 +1805,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.end_headers()
 
+    def _send_file(self, path, mime):
+        try:
+            size = os.path.getsize(path)
+            handle = open(path, "rb")
+        except OSError:
+            self._send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", CACHE_CONTROL)
+        self.end_headers()
+        try:
+            shutil.copyfileobj(handle, self.wfile, 65536)
+        finally:
+            handle.close()
+
+    def _attachment_path(self, att_id):
+        try:
+            att_id = int(att_id)
+        except ValueError:
+            return None
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT filename, mime_type FROM attachment WHERE ROWID=?", (att_id,)
+        ).fetchone()
+        conn.close()
+        if not row or not row["filename"]:
+            return None
+        path = os.path.expanduser(row["filename"])
+        mime = row["mime_type"] or mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return path, mime
+
     def _serve_avatar(self, avatar_id):
         entry = AVATAR_INDEX.get(avatar_id)
         if not entry:
@@ -1415,42 +1847,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", CACHE_CONTROL)
         self.end_headers()
         self.wfile.write(data)
 
-    def _serve_attachment(self, att_id):
-        try:
-            att_id = int(att_id)
-        except ValueError:
+    def _serve_thumb(self, att_id):
+        info = self._attachment_path(att_id)
+        if not info:
             self._send_error(404)
             return
-        conn = get_conn()
-        row = conn.execute(
-            "SELECT filename, mime_type FROM attachment WHERE ROWID=?", (att_id,)
-        ).fetchone()
-        conn.close()
-        if not row or not row["filename"]:
-            self._send_error(404)
-            return
-        path = os.path.expanduser(row["filename"])
-        mime = row["mime_type"] or mimetypes.guess_type(path)[0] or "application/octet-stream"
-
-        if mime in ("image/heic", "image/heif") or path.lower().endswith((".heic", ".heif")):
-            converted = convert_heic(path)
-            if converted:
-                path, mime = converted, "image/jpeg"
-
+        path, mime = info
         if not os.path.exists(path):
             self._send_error(404)
             return
+        thumb = make_thumb(path) if mime.startswith("image/") or is_heic(path, mime) else None
+        if thumb:
+            self._send_file(thumb, "image/jpeg")
+            return
+        if is_heic(path, mime):
+            converted = convert_heic(path)
+            if converted:
+                self._send_file(converted, "image/jpeg")
+                return
+        self._send_file(path, mime)
 
-        with open(path, "rb") as f:
-            data = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", mime)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def _serve_attachment(self, att_id):
+        info = self._attachment_path(att_id)
+        if not info:
+            self._send_error(404)
+            return
+        path, mime = info
+        if is_heic(path, mime):
+            converted = convert_heic(path)
+            if converted:
+                path, mime = converted, "image/jpeg"
+        if not os.path.exists(path):
+            self._send_error(404)
+            return
+        self._send_file(path, mime)
 
 
 if __name__ == "__main__":
