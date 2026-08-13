@@ -169,6 +169,7 @@ def normalize_email(s):
 
 def load_contacts():
     lookup = {}
+    photos = {}
     paths = []
     for pattern in CONTACTS_GLOBS:
         paths.extend(glob.glob(pattern))
@@ -178,29 +179,53 @@ def load_contacts():
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             names = {}
+            record_photos = {}
             for r in conn.execute(
-                "SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZNICKNAME FROM ZABCDRECORD"
+                "SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZNICKNAME, "
+                "ZTHUMBNAILIMAGEDATA, ZIMAGEDATA FROM ZABCDRECORD"
             ):
                 full = " ".join(p for p in [r["ZFIRSTNAME"], r["ZLASTNAME"]] if p).strip()
                 name = full or r["ZNICKNAME"] or r["ZORGANIZATION"]
                 if name:
                     names[r["Z_PK"]] = name
+                raw = r["ZTHUMBNAILIMAGEDATA"] or r["ZIMAGEDATA"]
+                if raw and len(raw) > 100:
+                    image = raw[1:]  # AddressBook prefixes a version byte
+                    if image.startswith(b"\x89PNG"):
+                        record_photos[r["Z_PK"]] = ("image/png", image)
+                    elif image.startswith(b"\xff\xd8\xff"):
+                        record_photos[r["Z_PK"]] = ("image/jpeg", image)
             for r in conn.execute("SELECT ZOWNER, ZFULLNUMBER FROM ZABCDPHONENUMBER"):
                 name = names.get(r["ZOWNER"])
                 key = normalize_phone(r["ZFULLNUMBER"])
                 if name and key:
                     lookup["phone:" + key] = name
+                    if r["ZOWNER"] in record_photos:
+                        photos["phone:" + key] = record_photos[r["ZOWNER"]]
             for r in conn.execute("SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS"):
                 name = names.get(r["ZOWNER"])
                 if name and r["ZADDRESS"]:
-                    lookup["email:" + normalize_email(r["ZADDRESS"])] = name
+                    email_key = "email:" + normalize_email(r["ZADDRESS"])
+                    lookup[email_key] = name
+                    if r["ZOWNER"] in record_photos:
+                        photos[email_key] = record_photos[r["ZOWNER"]]
             conn.close()
         except Exception:
             continue
-    return lookup
+
+    # A photo reused byte-for-byte under two different names is a generic
+    # placeholder (e.g. macOS's own "photo sync failed" icon), not a real
+    # picture of either person, so drop it everywhere it appears.
+    names_by_photo = {}
+    for key, (_, image) in photos.items():
+        names_by_photo.setdefault(image, set()).add(lookup[key])
+    photos = {k: v for k, v in photos.items() if len(names_by_photo[v[1]]) == 1}
+
+    return lookup, photos
 
 
-CONTACTS = load_contacts()
+CONTACTS, CONTACT_PHOTOS = load_contacts()
+AVATAR_INDEX = {hashlib.sha1(k.encode()).hexdigest()[:16]: mime_bytes for k, mime_bytes in CONTACT_PHOTOS.items()}
 
 
 def resolve_contact(identifier):
@@ -209,6 +234,15 @@ def resolve_contact(identifier):
     if "@" in identifier:
         return CONTACTS.get("email:" + normalize_email(identifier))
     return CONTACTS.get("phone:" + normalize_phone(identifier))
+
+
+def avatar_id(identifier):
+    if not identifier:
+        return None
+    key = "email:" + normalize_email(identifier) if "@" in identifier else "phone:" + normalize_phone(identifier)
+    if key not in CONTACT_PHOTOS:
+        return None
+    return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
 def load_participants(conn, chat_ids):
@@ -229,7 +263,10 @@ def load_participants(conn, chat_ids):
 AVATAR_COLORS = ["#ff9500", "#ff3b30", "#af52de", "#5856d6", "#007aff", "#34c759", "#ff2d55", "#5ac8fa"]
 
 
-def avatar_html(name):
+def avatar_html(name, identifier=None):
+    aid = avatar_id(identifier)
+    if aid:
+        return f'<img class="avatar" src="/avatar/{aid}">'
     initial = (name or "?").strip()[:1].upper() or "?"
     color = AVATAR_COLORS[sum(ord(c) for c in (name or "")) % len(AVATAR_COLORS)]
     return f'<span class="avatar" style="background:{color}">{html.escape(initial)}</span>'
@@ -427,6 +464,7 @@ def build_heatmap_html(conn, chat_id=None):
 
     month_spans = []
     seen_months = set()
+    first_span = True
     for wi, week in enumerate(cells_by_week):
         first_valid = next((d for d in week if d), None)
         if not first_valid:
@@ -435,7 +473,9 @@ def build_heatmap_html(conn, chat_id=None):
         key = (d.year, d.month)
         if key not in seen_months and d.day <= 7:
             seen_months.add(key)
-            month_spans.append((wi, d.strftime("%b")))
+            label = d.strftime("%b '%y") if d.month == 1 or first_span else d.strftime("%b")
+            month_spans.append((wi, label))
+            first_span = False
 
     month_html = "".join(
         f'<span style="grid-column:{wi + 1}">{label}</span>' for wi, label in month_spans
@@ -514,7 +554,7 @@ body.mediapage main { padding-right: 56px; }
 .searchresult:hover { background: #f5f8ff; }
 .sr-meta { font-size: 11px; color: #888; margin-bottom: 4px; }
 .sr-text { font-size: 14px; white-space: pre-wrap; }
-.avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 14px; font-weight: 600; margin-right: 4px; flex-shrink: 0; }
+.avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 14px; font-weight: 600; margin-right: 4px; flex-shrink: 0; object-fit: cover; }
 tr.chatrow td.name { display: flex; align-items: center; gap: 10px; }
 .heatmap-wrap { background: #fff; border-radius: 8px; padding: 10px 14px 12px; margin-bottom: 12px; overflow-x: auto; }
 .heatmap-months { display: grid; grid-auto-flow: column; grid-auto-columns: 14px; font-size: 10px; color: #999; height: 14px; margin-bottom: 3px; white-space: nowrap; }
@@ -584,6 +624,7 @@ def render_chat_list(sort="recent"):
         {
             "id": r["id"],
             "name": chat_label(r["display_name"], r["chat_identifier"], participants_map.get(r["id"])),
+            "identifier": r["chat_identifier"],
             "count": r["msg_count"],
             "last": r["last_date"],
             "first": r["first_date"],
@@ -606,7 +647,7 @@ def render_chat_list(sort="recent"):
         trs.append(
             f'<tr class="chatrow" onclick="location.href=\'/chat/{it["id"]}\'" '
             f'data-search="{html.escape(it["name"].lower())}">'
-            f'<td class="name">{avatar_html(it["name"])}{html.escape(it["name"])}</td>'
+            f'<td class="name">{avatar_html(it["name"], it["identifier"])}{html.escape(it["name"])}</td>'
             f'<td class="count">{it["count"]}</td>'
             f'<td class="last">{apple_date(it["last"])}</td>'
             f"</tr>"
@@ -654,7 +695,9 @@ def render_chat(chat_id, date_str=None, around_id=None):
     ).fetchone()
     media_count = conn.execute(
         """SELECT count(*) FROM message_attachment_join maj
-           JOIN chat_message_join cmj ON cmj.message_id = maj.message_id WHERE cmj.chat_id=?""",
+           JOIN chat_message_join cmj ON cmj.message_id = maj.message_id
+           JOIN attachment att ON att.ROWID = maj.attachment_id
+           WHERE cmj.chat_id=? AND att.filename NOT LIKE '%.pluginPayloadAttachment'""",
         (chat_id,),
     ).fetchone()[0]
 
@@ -850,7 +893,7 @@ def render_media(chat_id):
            JOIN attachment att ON att.ROWID = maj.attachment_id
            JOIN message m ON m.ROWID = maj.message_id
            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-           WHERE cmj.chat_id = ?
+           WHERE cmj.chat_id = ? AND att.filename NOT LIKE '%.pluginPayloadAttachment'
            ORDER BY m.date DESC""",
         (chat_id,),
     ).fetchall()
@@ -1032,6 +1075,7 @@ def compute_contact_stats(conn):
         items.append(
             {
                 "name": resolve_contact(r["handle"]) or r["handle"],
+                "handle": r["handle"],
                 "count": r["c"],
                 "chat_count": chat_counts.get(r["handle"], 1),
                 "chat_id": chat_per_handle.get(r["handle"]),
@@ -1067,7 +1111,7 @@ def render_leaderboard(items, max_count):
         clickable = ' class="lbrow clickable" onclick="location.href=\'/chat/{}\'"'.format(it["chat_id"]) if it.get("chat_id") else ' class="lbrow"'
         rows.append(
             f'<div{clickable} style="animation-delay:{i * 40}ms">'
-            f'<div class="lbname">{avatar_html(it["name"])}{html.escape(it["name"])}</div>'
+            f'<div class="lbname">{avatar_html(it["name"], it["handle"])}{html.escape(it["name"])}</div>'
             f'<div class="lbtrack"><div class="lbbar" data-target="{pct}%"></div></div>'
             f'<div class="lbcount countup" data-count="{it["count"]}">0</div>'
             f"</div>"
@@ -1081,7 +1125,7 @@ def render_contact_cards(items, sub_fn):
         clickable = ' clickable" onclick="location.href=\'/chat/{}\'"'.format(it["chat_id"]) if it.get("chat_id") else '"'
         out.append(
             f'<div class="ccard{clickable} style="animation-delay:{i * 40}ms">'
-            f'<div class="ccard-left">{avatar_html(it["name"])}'
+            f'<div class="ccard-left">{avatar_html(it["name"], it["handle"])}'
             f'<div><div class="ccard-name">{html.escape(it["name"])}</div>'
             f'<div class="ccard-sub">{sub_fn(it)}</div></div></div>'
             f'<div class="ccard-count countup" data-count="{it["count"]}">0</div>'
@@ -1318,6 +1362,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(out) if out is not None else self._send_error(404)
         elif parts[0] == "attachment" and len(parts) == 2:
             self._serve_attachment(parts[1])
+        elif parts[0] == "avatar" and len(parts) == 2:
+            self._serve_avatar(parts[1])
         else:
             self._send_error(404)
 
@@ -1359,6 +1405,18 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error(self, code):
         self.send_response(code)
         self.end_headers()
+
+    def _serve_avatar(self, avatar_id):
+        entry = AVATAR_INDEX.get(avatar_id)
+        if not entry:
+            self._send_error(404)
+            return
+        mime, data = entry
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _serve_attachment(self, att_id):
         try:
