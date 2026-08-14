@@ -79,13 +79,17 @@ def _token_subspan(short, long_tokens):
     return False
 
 
-def frequent_phrases(counts, limit=TOP_PHRASES, min_count=MIN_PHRASE_COUNT):
+def frequent_phrases(counts, stop=(), limit=TOP_PHRASES, min_count=MIN_PHRASE_COUNT):
     """Rank frequent phrases of any length. Drop a short phrase when longer ones cover it."""
+    weak = set(stop) | PHRASE_SKIP
     items = []
     for phrase, n in counts.items():
         if n < min_count:
             continue
-        items.append((phrase.split(), phrase, n))
+        toks = phrase.split()
+        if toks and all(t in weak for t in toks):
+            continue
+        items.append((toks, phrase, n))
     items.sort(key=lambda x: (-len(x[0]), -x[2]))
     kept = []
     for toks, phrase, n in items:
@@ -93,8 +97,16 @@ def frequent_phrases(counts, limit=TOP_PHRASES, min_count=MIN_PHRASE_COUNT):
         if n - explained < min_count:
             continue
         kept.append((toks, phrase, n))
-    kept.sort(key=lambda x: (-x[2] * len(x[0]), -x[2], x[1]))
-    return [{"phrase": p, "n": n} for _, p, n in kept[:limit]]
+    two = [x for x in kept if len(x[0]) == 2]
+    longer = [x for x in kept if len(x[0]) >= 3]
+    two.sort(key=lambda x: (-x[2], x[1]))
+    longer.sort(key=lambda x: (-x[2] * len(x[0]), -x[2], x[1]))
+    n_two = min(len(two), limit // 2)
+    n_longer = min(len(longer), limit - n_two)
+    n_two = min(len(two), limit - n_longer)
+    chosen = two[:n_two] + longer[:n_longer]
+    chosen.sort(key=lambda x: (-x[2] * len(x[0]), -x[2], x[1]))
+    return [{"phrase": p, "n": n} for _, p, n in chosen[:limit]]
 
 
 def _name_tokens(name):
@@ -195,7 +207,7 @@ def build_voice_stats(force=False, verbose=False):
         return None
 
     words = [{"word": w, "n": n} for w, n in overall.most_common(TOP_WORDS)]
-    phrases = frequent_phrases(ngrams)
+    phrases = frequent_phrases(ngrams, stop=stop)
 
     people = []
     for handle, msgs in per_n.most_common():
