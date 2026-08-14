@@ -18,16 +18,16 @@ from contacts import (
 from db import (
     REACTION_EXCLUDE_SQL,
     apple_date,
+    chat_filter,
     date_to_apple_ns,
     fetch_messages,
     fetch_messages_around,
     get_conn,
     has_neighbor,
+    merged_chat_ids,
     load_attachments,
     load_reactions,
     message_text,
-    reaction_label,
-    strip_guid_prefix,
 )
 from search import (
     index_error,
@@ -254,12 +254,13 @@ def render_message_blocks(
 
 def build_heatmap_html(conn, chat_id=None):
     if chat_id is not None:
+        chat_sql, chat_params = chat_filter(conn, chat_id)
         counts = conn.execute(
-            """SELECT date(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as day, count(*) c
+            f"""SELECT date(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as day, count(*) c
                FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-               WHERE cmj.chat_id=? AND """ + REACTION_EXCLUDE_SQL + """
+               WHERE {chat_sql} AND {REACTION_EXCLUDE_SQL}
                GROUP BY day""",
-            (chat_id,),
+            chat_params,
         ).fetchall()
     else:
         counts = conn.execute(
@@ -353,6 +354,26 @@ SORT_OPTIONS = {
 }
 
 
+def merge_split_chats(items, groups):
+    """Collapse the rows that the chat view already reads as one thread. The
+    biggest chat of a group carries the row, so its link opens the same merged
+    history that the counts describe."""
+    by_group = {}
+    for it in items:
+        by_group.setdefault(groups[it["id"]], []).append(it)
+    merged = []
+    for group in by_group.values():
+        lead = max(group, key=lambda x: x["count"])
+        if len(group) > 1:
+            lead = dict(lead)
+            lead["count"] = sum(x["count"] for x in group)
+            lead["first"] = min(x["first"] for x in group)
+            lead["last"] = max(x["last"] for x in group)
+            lead["known"] = any(x["known"] for x in group)
+        merged.append(lead)
+    return merged
+
+
 def render_chat_list(sort="recent"):
     conn = get_conn()
     rows = conn.execute(
@@ -368,6 +389,7 @@ def render_chat_list(sort="recent"):
         r["id"] for r in rows if not r["display_name"] and not resolve_contact(r["chat_identifier"])
     ]
     participants_map = load_participants(conn, need_participants)
+    groups = {r["id"]: merged_chat_ids(conn, r["id"]) for r in rows}
     conn.close()
 
     def is_known(display_name, chat_identifier, participants):
@@ -387,6 +409,7 @@ def render_chat_list(sort="recent"):
         }
         for r in rows
     ]
+    items = merge_split_chats(items, groups)
 
     if sort == "name":
         items.sort(key=lambda x: x["name"].lower())
@@ -450,17 +473,18 @@ def render_chat(chat_id, date_str=None, around_id=None):
         conn.close()
         return None
 
+    chat_sql, chat_params = chat_filter(conn, chat_id)
     bounds = conn.execute(
-        """SELECT min(m.date) as lo, max(m.date) as hi FROM message m
-           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID WHERE cmj.chat_id=?""",
-        (chat_id,),
+        f"""SELECT min(m.date) as lo, max(m.date) as hi FROM message m
+           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID WHERE {chat_sql}""",
+        chat_params,
     ).fetchone()
     media_count = conn.execute(
-        """SELECT count(*) FROM message_attachment_join maj
+        f"""SELECT count(*) FROM message_attachment_join maj
            JOIN chat_message_join cmj ON cmj.message_id = maj.message_id
            JOIN attachment att ON att.ROWID = maj.attachment_id
-           WHERE cmj.chat_id=? AND att.filename NOT LIKE '%.pluginPayloadAttachment'""",
-        (chat_id,),
+           WHERE {chat_sql} AND att.filename NOT LIKE '%.pluginPayloadAttachment'""",
+        chat_params,
     ).fetchone()[0]
 
     start_newest = load_prefs()["start"] == START_NEWEST
@@ -731,15 +755,16 @@ def render_media(chat_id):
         conn.close()
         return None
 
+    chat_sql, chat_params = chat_filter(conn, chat_id)
     media = conn.execute(
-        """SELECT att.ROWID as att_id, att.mime_type, att.filename, m.ROWID as msg_id, m.date
+        f"""SELECT att.ROWID as att_id, att.mime_type, att.filename, m.ROWID as msg_id, m.date
            FROM message_attachment_join maj
            JOIN attachment att ON att.ROWID = maj.attachment_id
            JOIN message m ON m.ROWID = maj.message_id
            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-           WHERE cmj.chat_id = ? AND att.filename NOT LIKE '%.pluginPayloadAttachment'
+           WHERE {chat_sql} AND att.filename NOT LIKE '%.pluginPayloadAttachment'
            ORDER BY m.date ASC, m.ROWID ASC""",
-        (chat_id,),
+        chat_params,
     ).fetchall()
 
     participants = None
@@ -840,6 +865,7 @@ def render_indexing_page(query, chat_id=None):
 
 def render_search(query, chat_id=None):
     chat_title = None
+    chat_ids = None
     if chat_id is not None:
         conn = get_conn()
         chat = conn.execute(
@@ -852,6 +878,7 @@ def render_search(query, chat_id=None):
         if not chat["display_name"] and not resolve_contact(chat["chat_identifier"]):
             participants = load_participants(conn, [chat_id]).get(chat_id)
         chat_title = chat_label(chat["display_name"], chat["chat_identifier"], participants)
+        chat_ids = merged_chat_ids(conn, chat_id)
         conn.close()
 
     q = (query or "").strip()
@@ -860,7 +887,7 @@ def render_search(query, chat_id=None):
         if not is_index_ready():
             return render_indexing_page(query, chat_id)
 
-    rows, phrases, terms, broadened = search_messages(q, chat_id=chat_id) if q else ([], [], [], False)
+    rows, phrases, terms, broadened = search_messages(q, chat_ids=chat_ids) if q else ([], [], [], False)
     truncated = len(rows) > SEARCH_LIMIT
     rows = rows[:SEARCH_LIMIT]
 

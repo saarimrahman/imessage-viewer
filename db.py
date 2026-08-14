@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config import APPLE_EPOCH, DB_PATH, PAGE_SIZE, SNAPSHOT_DB
-from contacts import resolve_contact
+from contacts import person_key, resolve_contact
 
 _snapshot_ready = False
 
@@ -117,6 +117,49 @@ def strip_guid_prefix(guid):
     return guid.rsplit("/", 1)[-1] if guid else guid
 
 
+CHAT_GROUPS = None
+
+
+def build_chat_groups(conn):
+    """Group the one-to-one chats that hold one person's history. Messages.app
+    opens a second chat row when somebody moves between SMS and iMessage, or
+    texts from a second number that sits on the same contact card. Only chats
+    with exactly one participant qualify, so no group chat ever merges."""
+    handles = {}
+    for r in conn.execute(
+        """SELECT chj.chat_id, h.id as handle
+           FROM chat_handle_join chj JOIN handle h ON h.ROWID = chj.handle_id"""
+    ):
+        handles.setdefault(r["chat_id"], set()).add(r["handle"])
+    by_person = {}
+    for chat_id, chat_handles in handles.items():
+        if len(chat_handles) != 1:
+            continue
+        key = person_key(next(iter(chat_handles)))
+        if key:
+            by_person.setdefault(key, []).append(chat_id)
+    groups = {}
+    for chat_ids in by_person.values():
+        if len(chat_ids) > 1:
+            merged = tuple(sorted(chat_ids))
+            for chat_id in merged:
+                groups[chat_id] = merged
+    return groups
+
+
+def merged_chat_ids(conn, chat_id):
+    global CHAT_GROUPS
+    if CHAT_GROUPS is None:
+        CHAT_GROUPS = build_chat_groups(conn)
+    return CHAT_GROUPS.get(chat_id, (chat_id,))
+
+
+def chat_filter(conn, chat_id, alias="cmj"):
+    """SQL and parameters that select every message of the merged chat."""
+    chat_ids = merged_chat_ids(conn, chat_id)
+    return f"{alias}.chat_id IN ({','.join('?' * len(chat_ids))})", list(chat_ids)
+
+
 def load_reactions(conn, chat_id, guids):
     """Tapbacks are stored as their own message rows pointing at a target guid
     via associated_message_guid. A later 3xxx-type row for the same
@@ -125,15 +168,16 @@ def load_reactions(conn, chat_id, guids):
     if not guids:
         return {}
     guid_set = set(guids)
+    chat_sql, chat_params = chat_filter(conn, chat_id)
     rows = conn.execute(
-        """SELECT m.associated_message_guid, m.associated_message_type, m.associated_message_emoji,
+        f"""SELECT m.associated_message_guid, m.associated_message_type, m.associated_message_emoji,
                   m.is_from_me, m.date, h.id as handle
            FROM message m
            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
            LEFT JOIN handle h ON h.ROWID = m.handle_id
-           WHERE cmj.chat_id=? AND m.associated_message_type BETWEEN 2000 AND 3999
+           WHERE {chat_sql} AND m.associated_message_type BETWEEN 2000 AND 3999
            ORDER BY m.date ASC""",
-        (chat_id,),
+        chat_params,
     ).fetchall()
 
     state = {}
@@ -163,8 +207,9 @@ MSG_SELECT = """SELECT m.ROWID as id, m.guid, m.text, m.attributedBody, m.date, 
 
 def fetch_messages(conn, chat_id, after=None, before=None, start_ns=None, limit=PAGE_SIZE, from_end=False):
     """Page by (date, ROWID). `after`/`before` are (date_ns, rowid) cursors."""
-    where = ["cmj.chat_id=?", REACTION_EXCLUDE_SQL]
-    params = [chat_id]
+    chat_sql, chat_params = chat_filter(conn, chat_id)
+    where = [chat_sql, REACTION_EXCLUDE_SQL]
+    params = list(chat_params)
     order = "m.date ASC, m.ROWID ASC"
     if after:
         date_ns, rowid = after
@@ -205,10 +250,11 @@ def has_neighbor(conn, chat_id, date_ns, rowid, direction):
         clause = "(m.date < ? OR (m.date = ? AND m.ROWID < ?))"
     else:
         clause = "(m.date > ? OR (m.date = ? AND m.ROWID > ?))"
+    chat_sql, chat_params = chat_filter(conn, chat_id)
     return conn.execute(
         f"""SELECT 1 FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-            WHERE cmj.chat_id=? AND {REACTION_EXCLUDE_SQL} AND {clause} LIMIT 1""",
-        (chat_id, date_ns, date_ns, rowid),
+            WHERE {chat_sql} AND {REACTION_EXCLUDE_SQL} AND {clause} LIMIT 1""",
+        chat_params + [date_ns, date_ns, rowid],
     ).fetchone() is not None
 
 
@@ -233,16 +279,17 @@ def fetch_messages_around(conn, chat_id, target_id, half=75):
     if not target:
         return []
     tgt_date = target["date"]
+    chat_sql, chat_params = chat_filter(conn, chat_id)
     before_rows = conn.execute(
         f"""{MSG_SELECT}
-           WHERE cmj.chat_id=? AND (m.date < ? OR (m.date = ? AND m.ROWID <= ?)) AND {REACTION_EXCLUDE_SQL}
+           WHERE {chat_sql} AND (m.date < ? OR (m.date = ? AND m.ROWID <= ?)) AND {REACTION_EXCLUDE_SQL}
            ORDER BY m.date DESC, m.ROWID DESC LIMIT ?""",
-        (chat_id, tgt_date, tgt_date, target_id, half),
+        chat_params + [tgt_date, tgt_date, target_id, half],
     ).fetchall()
     after_rows = conn.execute(
         f"""{MSG_SELECT}
-           WHERE cmj.chat_id=? AND (m.date > ? OR (m.date = ? AND m.ROWID > ?)) AND {REACTION_EXCLUDE_SQL}
+           WHERE {chat_sql} AND (m.date > ? OR (m.date = ? AND m.ROWID > ?)) AND {REACTION_EXCLUDE_SQL}
            ORDER BY m.date ASC, m.ROWID ASC LIMIT ?""",
-        (chat_id, tgt_date, tgt_date, target_id, half),
+        chat_params + [tgt_date, tgt_date, target_id, half],
     ).fetchall()
     return list(reversed(before_rows)) + list(after_rows)

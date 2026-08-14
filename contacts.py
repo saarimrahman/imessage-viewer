@@ -21,6 +21,7 @@ def normalize_email(s):
 def load_contacts():
     lookup = {}
     photos = {}
+    owners = {}
     paths = []
     for pattern in CONTACTS_GLOBS:
         paths.extend(glob.glob(pattern))
@@ -51,6 +52,7 @@ def load_contacts():
                 key = normalize_phone(r["ZFULLNUMBER"])
                 if name and key:
                     lookup["phone:" + key] = name
+                    owners["phone:" + key] = f"{path}:{r['ZOWNER']}"
                     if r["ZOWNER"] in record_photos:
                         photos["phone:" + key] = record_photos[r["ZOWNER"]]
             for r in conn.execute("SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS"):
@@ -58,6 +60,7 @@ def load_contacts():
                 if name and r["ZADDRESS"]:
                     email_key = "email:" + normalize_email(r["ZADDRESS"])
                     lookup[email_key] = name
+                    owners[email_key] = f"{path}:{r['ZOWNER']}"
                     if r["ZOWNER"] in record_photos:
                         photos[email_key] = record_photos[r["ZOWNER"]]
             conn.close()
@@ -72,26 +75,41 @@ def load_contacts():
         names_by_photo.setdefault(image, set()).add(lookup[key])
     photos = {k: v for k, v in photos.items() if len(names_by_photo[v[1]]) == 1}
 
-    return lookup, photos
+    return lookup, photos, owners
 
 
-CONTACTS, CONTACT_PHOTOS = load_contacts()
+CONTACTS, CONTACT_PHOTOS, CONTACT_OWNERS = load_contacts()
 AVATAR_INDEX = {hashlib.sha1(k.encode()).hexdigest()[:16]: mime_bytes for k, mime_bytes in CONTACT_PHOTOS.items()}
 
 
-def resolve_contact(identifier):
+def handle_key(identifier):
     if not identifier:
         return None
     if "@" in identifier:
-        return CONTACTS.get("email:" + normalize_email(identifier))
-    return CONTACTS.get("phone:" + normalize_phone(identifier))
+        return "email:" + normalize_email(identifier)
+    key = normalize_phone(identifier)
+    return "phone:" + key if key else None
+
+
+def resolve_contact(identifier):
+    key = handle_key(identifier)
+    return CONTACTS.get(key) if key else None
+
+
+def person_key(identifier):
+    """One key for every handle that belongs to the same person. A contact card
+    that lists a number and an address collapses both onto its record. A handle
+    with no card falls back to its own normalized form, so the same number in
+    two formats still merges."""
+    key = handle_key(identifier)
+    if not key:
+        return None
+    return CONTACT_OWNERS.get(key, key)
 
 
 def avatar_id(identifier):
-    if not identifier:
-        return None
-    key = "email:" + normalize_email(identifier) if "@" in identifier else "phone:" + normalize_phone(identifier)
-    if key not in CONTACT_PHOTOS:
+    key = handle_key(identifier)
+    if not key or key not in CONTACT_PHOTOS:
         return None
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 

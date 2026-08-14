@@ -9,7 +9,7 @@ import time
 
 from config import SEARCH_DB, SEARCH_LIMIT, SEARCH_SCHEMA, VOICE_CACHE
 from contacts import chat_label, load_participants, resolve_contact
-from db import REACTION_EXCLUDE_SQL, DbUnavailable, get_conn, message_text
+from db import REACTION_EXCLUDE_SQL, DbUnavailable, get_conn, merged_chat_ids, message_text
 
 _index_lock = threading.Lock()
 _index_ready = False
@@ -295,22 +295,22 @@ def ensure_indexes(force=False):
             _index_building = False
 
 
-def _search_match(conn, match, chat_id, limit):
+def _search_match(conn, match, chat_ids, limit):
     # FTS5 MATCH needs the real table name on the left. An alias like
     # `docs_fts f ... WHERE f MATCH ?` raises "no such column: f".
     sql = """SELECT d.msg_id, d.chat_id, d.date, d.is_from_me, d.handle, d.body
              FROM docs_fts JOIN docs d ON d.id = docs_fts.rowid
              WHERE docs_fts MATCH ?"""
     params = [match]
-    if chat_id is not None:
-        sql += " AND d.chat_id = ?"
-        params.append(chat_id)
+    if chat_ids:
+        sql += f" AND d.chat_id IN ({','.join('?' * len(chat_ids))})"
+        params.extend(chat_ids)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
     return conn.execute(sql, params).fetchall()
 
 
-def search_messages(query, chat_id=None, limit=SEARCH_LIMIT):
+def search_messages(query, chat_ids=None, limit=SEARCH_LIMIT):
     phrases, terms = parse_search_query(query)
     match_and = to_fts_query(phrases, terms, "AND")
     if not match_and:
@@ -320,11 +320,11 @@ def search_messages(query, chat_id=None, limit=SEARCH_LIMIT):
     conn.row_factory = sqlite3.Row
     broadened = False
     try:
-        rows = _search_match(conn, match_and, chat_id, limit + 1)
+        rows = _search_match(conn, match_and, chat_ids, limit + 1)
         if not rows:
             match_or = to_fts_query(phrases, terms, "OR")
             if match_or and match_or != match_and:
-                rows = _search_match(conn, match_or, chat_id, limit + 1)
+                rows = _search_match(conn, match_or, chat_ids, limit + 1)
                 broadened = bool(rows)
     except sqlite3.OperationalError:
         rows = []
@@ -344,11 +344,14 @@ def matching_conversations(query, limit=8):
     ).fetchall()
     need = [r["id"] for r in rows if not r["display_name"] and not resolve_contact(r["chat_identifier"])]
     pmap = load_participants(conn, need)
+    groups = {r["id"]: merged_chat_ids(conn, r["id"]) for r in rows}
     conn.close()
     hits = []
+    seen = set()
     for r in rows:
         name = chat_label(r["display_name"], r["chat_identifier"], pmap.get(r["id"]))
-        if needle in name.lower():
+        if needle in name.lower() and groups[r["id"]] not in seen:
+            seen.add(groups[r["id"]])
             hits.append((r["id"], name, r["chat_identifier"]))
     hits.sort(key=lambda x: x[1].lower())
     return hits[:limit]
