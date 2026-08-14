@@ -722,16 +722,110 @@ body.chatpage { background: var(--bg-chat); }
   box-shadow: var(--shadow);
 }
 
-.reaction-pill {
+.msgbody {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.row.me .msgbody { align-items: flex-end; }
+.row.them .msgbody { align-items: flex-start; }
+.row.has-tapback { margin-top: 18px; }
+/* Keep the badge off the sender name of a short bubble. */
+.row.has-tapback .sender { margin-bottom: 14px; }
+
+/* The badge overlaps the top inner corner of the bubble, as iMessage does. Two
+   dots below it point back at the corner. */
+.tapbacks {
+  position: absolute;
+  top: -13px;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 7px;
+  border: none;
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 2;
+  transition: scale 0.14s var(--ease);
+}
+
+.row.them .tapbacks { right: 4px; }
+.row.me .tapbacks { left: 4px; }
+.tapbacks:hover { scale: 1.08; }
+.tapbacks:active { scale: 0.96; }
+
+.tapbacks::before,
+.tapbacks::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.tapbacks::before {
+  width: 7px;
+  height: 7px;
+  bottom: -4px;
+}
+
+.tapbacks::after {
+  width: 4px;
+  height: 4px;
+  bottom: -9px;
+}
+
+.row.them .tapbacks::before { right: 5px; }
+.row.them .tapbacks::after { right: 1px; }
+.row.me .tapbacks::before { left: 5px; }
+.row.me .tapbacks::after { left: 1px; }
+
+.tapback-emoji { font-size: 12px; }
+
+.tapback-count {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ink-soft);
+  margin-left: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tapback-pop {
+  position: fixed;
+  z-index: 1100;
+  min-width: 148px;
+  max-width: 260px;
+  padding: 6px;
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-hover), var(--shadow-float);
+  display: none;
+}
+
+.tapback-pop.open { display: block; }
+
+.tapback-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.tapback-pop-row .who { flex: 1; }
+
+.tapback-pop-row .verb {
   font-size: 11px;
   font-weight: 600;
-  background: var(--surface);
-  color: var(--ink-soft);
-  padding: 3px 9px;
-  border-radius: 999px;
-  margin-top: 4px;
-  display: inline-block;
-  box-shadow: var(--shadow);
+  color: var(--muted);
 }
 
 img.att, video.att {
@@ -1547,4 +1641,5 @@ code {
   .lbbar { transition: none; }
   .lightbox-overlay.open .lightbox-content { animation: none; }
   .theme-icon { transition: none; }
+  .tapbacks { transition: none; }
 }

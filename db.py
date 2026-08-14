@@ -109,20 +109,21 @@ def message_text(row):
 REACTION_EXCLUDE_SQL = "(m.associated_message_type IS NULL OR m.associated_message_type NOT BETWEEN 2000 AND 3999)"
 
 REACTION_LABELS = {
-    2000: "❤️ Loved",
-    2001: "\U0001f44d Liked",
-    2002: "\U0001f44e Disliked",
-    2003: "\U0001f602 Laughed at",
-    2004: "‼️ Emphasized",
-    2005: "❓ Questioned",
-    2007: "\U0001f3f7️ Reacted with a sticker to",
+    2000: ("❤️", "Loved"),
+    2001: ("\U0001f44d", "Liked"),
+    2002: ("\U0001f44e", "Disliked"),
+    2003: ("\U0001f602", "Laughed at"),
+    2004: ("‼️", "Emphasized"),
+    2005: ("❓", "Questioned"),
+    2007: ("\U0001f3f7️", "Reacted with a sticker to"),
 }
 
 
-def reaction_label(assoc_type, emoji):
+def reaction_parts(assoc_type, emoji):
+    """The (emoji, verb) pair of a tapback. The badge shows the emoji alone."""
     if assoc_type == 2006 and emoji:
-        return f"{emoji} Reacted"
-    return REACTION_LABELS.get(assoc_type, "Reacted")
+        return (emoji, "Reacted")
+    return REACTION_LABELS.get(assoc_type, ("\U0001f44d", "Reacted"))
 
 
 def strip_guid_prefix(guid):
@@ -203,11 +204,12 @@ def load_reactions(conn, chat_id, guids):
             state.pop((target, reactor_key), None)
         else:
             who = "You" if r["is_from_me"] else (resolve_contact(r["handle"]) or r["handle"] or "Unknown")
-            state[(target, reactor_key)] = (reaction_label(t, r["associated_message_emoji"]), who)
+            emoji, verb = reaction_parts(t, r["associated_message_emoji"])
+            state[(target, reactor_key)] = (emoji, verb, who)
 
     out = {}
-    for (target, _reactor_key), (label, who) in state.items():
-        out.setdefault(target, []).append((label, who))
+    for (target, _reactor_key), reaction in state.items():
+        out.setdefault(target, []).append(reaction)
     return out
 
 

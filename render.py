@@ -206,6 +206,26 @@ def page(title, body, *, active="chats", header_left=None, header_right="", body
 </html>"""
 
 
+TAPBACK_BADGE_MAX = 3
+
+
+def build_tapbacks_html(reactions):
+    """The badge that sits on the corner of the bubble. It shows the distinct
+    emoji only. app.js reads data-detail to list who reacted."""
+    distinct = list(dict.fromkeys(emoji for emoji, _verb, _who in reactions))
+    shown = distinct[:TAPBACK_BADGE_MAX]
+    chips = "".join(f'<span class="tapback-emoji">{html.escape(emoji)}</span>' for emoji in shown)
+    if len(reactions) > len(shown):
+        chips += f'<span class="tapback-count">{len(reactions)}</span>'
+    detail = [{"emoji": emoji, "verb": verb, "who": who} for emoji, verb, who in reactions]
+    label = ", ".join(f"{verb} by {who}" for _emoji, verb, who in reactions)
+    return (
+        f'<button type="button" class="tapbacks" aria-haspopup="dialog" '
+        f'aria-label="{html.escape(label)}" '
+        f'data-detail="{html.escape(json.dumps(detail, ensure_ascii=False))}">{chips}</button>'
+    )
+
+
 def render_message_blocks(
     rows,
     att_by_msg,
@@ -275,17 +295,17 @@ def render_message_blocks(
             body = f'<div class="bubble{tail_cls}" style="opacity:.5">[no content]</div>'
 
         reactions = reactions_by_guid.get(r["guid"])
+        tapback_cls = ""
         if reactions:
-            grouped = {}
-            for label, who_reacted in reactions:
-                grouped.setdefault(label, []).append(who_reacted)
-            for label, names in grouped.items():
-                body += f'<div class="reaction-pill">{html.escape(label)} &middot; {html.escape(", ".join(names))}</div>'
+            body += build_tapbacks_html(reactions)
+            tapback_cls = " has-tapback"
 
-        parts.append(body)
+        parts.append(f'<div class="msgbody">{body}</div>')
         if is_last_in_group:
             parts.append(f'<div class="ts">{format_time(r["date"])}</div>')
-        blocks.append(f'<div class="row {who}{group_cls}{highlight_cls}" id="msg-{r["id"]}">{"".join(parts)}</div>')
+        blocks.append(
+            f'<div class="row {who}{group_cls}{highlight_cls}{tapback_cls}" id="msg-{r["id"]}">{"".join(parts)}</div>'
+        )
         prev_sender = sender_key
     return "".join(blocks)
 
