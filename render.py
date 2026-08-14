@@ -40,6 +40,7 @@ from search import (
 )
 from stats import (
     DRIFT_WINDOW_MONTHS,
+    ERA_MIN_MSGS,
     FELL_OFF_MIN_COUNT,
     FELL_OFF_MIN_GAP_DAYS,
     LONG_TERM_MAX_GAP_DAYS,
@@ -48,7 +49,9 @@ from stats import (
     monthly_by_person,
     monthly_counts,
     people_drift,
+    people_eras,
     people_over_time,
+    year_owners,
 )
 from voice import load_voice
 
@@ -713,6 +716,10 @@ def month_label(ym):
     return datetime.strptime(ym, "%Y-%m").strftime("%B %Y")
 
 
+def short_month(ym):
+    return datetime.strptime(ym, "%Y-%m").strftime("%b %Y")
+
+
 def media_tile_html(a, chat_id, chat_name=None, visual_only=False):
     mime = a["mime_type"] or mimetypes.guess_type(a["filename"] or "")[0] or ""
     is_image = mime.startswith("image/") or is_heic(a["filename"] or "", mime)
@@ -1224,7 +1231,7 @@ def render_people_drift(rising, faded, months, window):
             '<div class="dr-group"><span class="dr-tag down">Drifting away</span></div>'
             + drift_rows(faded, months, window, "down")
         )
-    return f"""<div class="trendwrap drift">
+    return f"""<div class="trendwrap drift" id="driftwrap">
 {groups}
 <div class="dr-row dr-axis"><span class="dr-name"></span><span class="dr-plot">
 <span class="dr-ax-l">{month_label(months[0])}</span>
@@ -1234,17 +1241,24 @@ def render_people_drift(rising, faded, months, window):
 {drift_table(rising, faded, window)}
 <div class="trendtip dr-tip" id="drifttip"></div>
 </div>
-<script>
+{spark_tip_script("driftwrap", "drifttip", DRIFT_W)}"""
+
+
+def spark_tip_script(wrap_id, tip_id, view_w):
+    """Hover tooltip for a stack of sparklines. Scoped to one wrapper, so two
+    charts on the same page do not steal each other's columns."""
+    return f"""<script>
 (function() {{
-  const tip = document.getElementById('drifttip');
-  if (!tip) return;
-  const wrap = tip.parentElement;
-  document.querySelectorAll('.dr-spark .hitcol').forEach(col => {{
+  const wrap = document.getElementById('{wrap_id}');
+  const tip = document.getElementById('{tip_id}');
+  if (!wrap || !tip) return;
+  wrap.querySelectorAll('.dr-spark .hitcol').forEach(col => {{
     col.addEventListener('mouseenter', () => {{
       const svg = col.ownerSVGElement, box = svg.getBoundingClientRect();
       const wbox = wrap.getBoundingClientRect();
-      tip.textContent = col.dataset.label + ' · ' + (+col.dataset.c).toLocaleString() + ' messages';
-      tip.style.left = (box.left - wbox.left + col.dataset.cx * box.width / {DRIFT_W}) + 'px';
+      const sub = col.dataset.sub ? ' · ' + col.dataset.sub : '';
+      tip.textContent = col.dataset.label + ' · ' + (+col.dataset.c).toLocaleString() + ' messages' + sub;
+      tip.style.left = (box.left - wbox.left + col.dataset.cx * box.width / {view_w}) + 'px';
       tip.style.top = (box.top - wbox.top) + 'px';
       tip.style.opacity = 1;
     }});
@@ -1252,6 +1266,81 @@ def render_people_drift(rising, faded, months, window):
   }});
 }})();
 </script>"""
+
+
+ERA_W, ERA_H = 240, 30
+
+
+def era_spark(person, months, january_x):
+    """One person's whole history, as a share of the month, scaled to their own
+    peak. A tick marks the peak month."""
+    shares = person["shares"]
+    n = len(shares)
+    top = max(shares) or 1
+    step = ERA_W / (n - 1) if n > 1 else ERA_W
+    xs = [i * step for i in range(n)]
+    ys = [ERA_H - 1.5 - (s / top) * (ERA_H - 3) for s in shares]
+    line = " ".join(f"{'M' if i == 0 else 'L'} {xs[i]:.1f} {ys[i]:.1f}" for i in range(n))
+    area = f"{line} L {xs[-1]:.1f} {ERA_H} L 0 {ERA_H} Z"
+    grid = "".join(
+        f'<line class="er-grid" x1="{x:.1f}" y1="0" x2="{x:.1f}" y2="{ERA_H}"></line>'
+        for x in january_x
+    )
+    peak = person["peak_i"]
+    hits = "".join(
+        f'<rect class="hitcol" x="{xs[i] - step / 2:.1f}" y="0" width="{step:.1f}" height="{ERA_H}" '
+        f'data-label="{month_label(months[i])}" data-c="{person["values"][i]}" '
+        f'data-sub="{shares[i] * 100:.0f}% of that month" data-cx="{xs[i]:.1f}"></rect>'
+        for i in range(n)
+    )
+    return (
+        f'<svg class="dr-spark era" viewBox="0 0 {ERA_W} {ERA_H}" preserveAspectRatio="none" '
+        f'role="img" aria-label="{html.escape(person["name"])} share of each month">'
+        f"{grid}"
+        f'<path class="dr-area" d="{area}"></path>'
+        f'<path class="dr-line" d="{line}" vector-effect="non-scaling-stroke"></path>'
+        f'<line class="er-peak" x1="{xs[peak]:.1f}" y1="{ys[peak]:.1f}" x2="{xs[peak]:.1f}" y2="{ERA_H}" '
+        f'vector-effect="non-scaling-stroke"></line>'
+        f"{hits}</svg>"
+    )
+
+
+def render_people_eras(eras, months):
+    if not eras:
+        return '<p class="empty">Not enough history yet to show an era.</p>'
+    january_x = [
+        i * ERA_W / (len(months) - 1)
+        for i, ym in enumerate(months)
+        if ym.endswith("-01") and i
+    ]
+    rows = []
+    for person in eras:
+        # Warm for an old peak, cool for a recent one, so the ladder reads as time.
+        t = person["peak_i"] / max(len(months) - 1, 1)
+        inner = (
+            f'<span class="dr-name">{html.escape(person["name"])}</span>'
+            f'<span class="dr-plot">{era_spark(person, months, january_x)}</span>'
+            f'<span class="er-when"><b>{short_month(person["peak_ym"])}</b>'
+            f'<span>{person["peak_share"] * 100:.0f}% of that month</span></span>'
+        )
+        style = f'style="--tone: color-mix(in oklab, var(--rise) {t * 100:.0f}%, var(--fade))"'
+        tag = "a" if person["chat_id"] else "div"
+        href = f' href="/chat/{person["chat_id"]}"' if person["chat_id"] else ""
+        rows.append(f'<{tag} class="dr-row er-row"{href} {style}>{inner}</{tag}>')
+
+    labels = "".join(
+        f'<span class="er-ax" style="left:{i * 100 / (len(months) - 1):.2f}%">{ym[:4]}</span>'
+        for i, ym in enumerate(months)
+        if ym.endswith("-01") and i
+    )
+    return f"""<div class="trendwrap drift eras" id="eraswrap">
+{"".join(rows)}
+<div class="dr-row dr-axis"><span class="dr-name"></span>
+<span class="dr-plot"><span class="dr-ax-l">{short_month(months[0])}</span>{labels}
+<span class="dr-ax-r">{short_month(months[-1])}</span></span><span class="er-when"></span></div>
+<div class="trendtip dr-tip" id="erastip"></div>
+</div>
+{spark_tip_script("eraswrap", "erastip", ERA_W)}"""
 
 
 def render_word_cloud(words):
@@ -1334,6 +1423,8 @@ def render_stats():
     )
     stream_series = people_over_time(people, all_months)
     rising, faded, drift_months = people_drift(people, all_months)
+    eras, era_months = people_eras(people, all_months)
+    owners = year_owners(people, all_months)
     heatmap_html = build_heatmap_html(conn)
     conn.close()
 
@@ -1387,6 +1478,11 @@ def render_stats():
         lambda it: f"Most messages in {month_label(it['peak_ym'])}",
     ) or '<p class="empty">Not enough history to find a peak month yet.</p>'
 
+    owners_html = render_contact_cards(
+        owners,
+        lambda it: f"{it['year']} · {it['share'] * 100:.0f}% of everything you received",
+    ) or '<p class="empty">Not enough history to name a year yet.</p>'
+
     body = f"""<main class="page">
 <div class="kpirow">{kpi_html}</div>
 
@@ -1399,6 +1495,15 @@ def render_stats():
 <p class="section-sub">Share of everything you received, last {DRIFT_WINDOW_MONTHS} months against the {DRIFT_WINDOW_MONTHS} before.
 Share, not raw count, because your total volume kept growing. Each line is scaled to its own peak.</p>
 {render_people_drift(rising, faded, drift_months, DRIFT_WINDOW_MONTHS)}
+
+<h2 class="section-h">Eras</h2>
+<p class="section-sub">Everyone with {ERA_MIN_MSGS}+ messages, all time, as a share of everything you received that month.
+Sorted by the month they held the largest share, so the list reads top to bottom as time.</p>
+{render_people_eras(eras, era_months)}
+
+<h2 class="section-h">Who held each year</h2>
+<p class="section-sub">The person with the largest share of everything you received, year by year.</p>
+{owners_html}
 
 <h2 class="section-h">When you were closest</h2>
 <p class="section-sub">The single busiest month with each of your {len(stream_series)} most-texted people.</p>
