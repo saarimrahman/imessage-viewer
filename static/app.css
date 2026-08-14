@@ -14,6 +14,9 @@
   --me: #0a84ff;
   --them: #e8eaef;
   --warn: #ffcc00;
+  --alert: #b42318;
+  --alert-bg: #fdecea;
+  --alert-line: rgba(180, 35, 24, 0.28);
   --hover: #f5f8fd;
   --bg-chat: #f7f8fb;
   --img-outline: rgba(0, 0, 0, 0.1);
@@ -64,6 +67,9 @@ html[data-theme="dark"] {
   --me: #0a84ff;
   --them: #2a2e38;
   --warn: #ffd60a;
+  --alert: #ff9d8f;
+  --alert-bg: #2c1512;
+  --alert-line: rgba(255, 120, 100, 0.32);
   --hover: #22262f;
   --bg-chat: #0c0e13;
   --img-outline: rgba(255, 255, 255, 0.1);
@@ -120,6 +126,53 @@ a:hover { color: var(--signal-deep); }
 }
 
 button, input, select { font: inherit; color: inherit; }
+
+/* ——— Access banner ——— */
+
+.alertbar {
+  background: var(--alert-bg);
+  border-bottom: 1px solid var(--alert-line);
+  color: var(--ink);
+  padding: 12px 20px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.alertbar-head {
+  margin: 0;
+  font-weight: 600;
+  color: var(--alert);
+}
+
+.alertbar-head::before { content: "●"; margin-right: 8px; font-size: 11px; vertical-align: 1px; }
+
+.alertbar-sub { margin: 2px 0 0; color: var(--ink-soft); }
+
+.alertbar-help { margin-top: 8px; }
+
+.alertbar summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--alert);
+  width: fit-content;
+}
+
+.alertbar ol { margin: 10px 0 0; padding-left: 22px; color: var(--ink-soft); }
+.alertbar li { margin-bottom: 6px; }
+
+.alertbar pre {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--alert-line);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-x: auto;
+}
+
+.alertbar-detail { margin: 12px 0 0; font-size: 12px; color: var(--muted); }
 
 /* ——— Top bar ——— */
 

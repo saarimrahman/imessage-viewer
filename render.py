@@ -24,6 +24,7 @@ from db import (
     fetch_messages_around,
     get_conn,
     has_neighbor,
+    live_db_error,
     merged_chat_ids,
     load_attachments,
     load_reactions,
@@ -142,6 +143,35 @@ def search_form_html(action, query="", placeholder="Search messages…", wide=Fa
     )
 
 
+def db_banner_html():
+    """Red bar on every page while macOS blocks the read of chat.db. Without it
+    the app looks healthy, because search and stats still serve cached data."""
+    detail = live_db_error()
+    if detail is None:
+        return ""
+    commands = (
+        f"cd {SCRIPT_DIR}\n"
+        "source .venv/bin/activate\n"
+        "python3 app.py"
+    )
+    return f"""<div class="alertbar" role="alert">
+<p class="alertbar-head">This Mac blocks access to your Messages database.</p>
+<p class="alertbar-sub">The app reads <code>{html.escape(DB_PATH)}</code>. Until macOS gives it access, every page shows old data or no data.</p>
+<details class="alertbar-help">
+<summary>How to get this app to work</summary>
+<ol>
+<li>Open System Settings → Privacy &amp; Security → Full Disk Access.</li>
+<li>Turn on the switch for the app that runs the server: Terminal, iTerm, or Cursor.</li>
+<li>Quit that app with Command-Q, then open it again.</li>
+<li>Run these commands in the terminal:
+<pre>{html.escape(commands)}</pre></li>
+<li>Reload this page.</li>
+</ol>
+<p class="alertbar-detail">{html.escape(detail)}</p>
+</details>
+</div>"""
+
+
 def page(title, body, *, active="chats", header_left=None, header_right="", body_class="", scripts="", chat_id=None):
     left = header_left if header_left is not None else (
         f'<a class="brand" href="/">Messages</a>{nav_html(active)}'
@@ -157,6 +187,7 @@ def page(title, body, *, active="chats", header_left=None, header_right="", body
 <link rel="stylesheet" href="{asset_url("app.css")}">
 </head>
 <body class="{html.escape(body_class)}"{data_chat}>
+{db_banner_html()}
 <header class="topbar">
 <div class="topbar-left">{left}</div>
 <div class="topbar-right">{header_right}{THEME_TOGGLE}</div>
@@ -1391,10 +1422,16 @@ Share, not raw count, because your total volume kept growing. Each line is scale
 
 
 def render_db_error(detail):
+    if live_db_error():
+        lead = "Open the steps in the red bar at the top of this page."
+    else:
+        lead = (
+            f"The file <code>{html.escape(DB_PATH)}</code> is readable, but SQLite cannot open it. "
+            "Quit Messages.app, then reload this page."
+        )
     body = f"""<main class="page">
 <h1 class="section-h">Cannot open the local Messages database</h1>
-<p>This app reads <code>{html.escape(DB_PATH)}</code> on this Mac. macOS blocks that unless the app running this terminal has Full Disk Access.</p>
-<p class="section-sub">System Settings → Privacy &amp; Security → Full Disk Access → enable Cursor (or Terminal), then restart the server.</p>
+<p>{lead}</p>
 <p class="muted">{html.escape(detail)}</p>
 </main>"""
     return page("Messages", body)

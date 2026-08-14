@@ -52,6 +52,18 @@ def get_conn():
         ) from e
 
 
+def live_db_error():
+    """Reason that this process cannot read chat.db, or None if it can. macOS
+    denies the read with EPERM until the app that runs the server has Full Disk
+    Access, so a plain open() separates that block from a SQLite-level fault."""
+    try:
+        with open(DB_PATH, "rb") as f:
+            f.read(16)
+    except OSError as e:
+        return str(e)
+    return None
+
+
 def apple_date(ns):
     if ns is None:
         return ""
