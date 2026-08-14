@@ -281,6 +281,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             shutil.copyfileobj(handle, self.wfile, 65536)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
         finally:
             handle.close()
 
