@@ -1,5 +1,40 @@
 (function () {
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const THEME_KEY = "theme";
+
+  function systemTheme() {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+
+  function storedTheme() {
+    const stored = localStorage.getItem(THEME_KEY);
+    return stored === "light" || stored === "dark" ? stored : null;
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    const btn = document.getElementById("themeToggle");
+    if (!btn) return;
+    const dark = theme === "dark";
+    btn.setAttribute("aria-pressed", dark ? "true" : "false");
+    btn.setAttribute("aria-label", dark ? "Switch to light mode" : "Switch to dark mode");
+  }
+
+  function initTheme() {
+    applyTheme(storedTheme() || systemTheme());
+    const btn = document.getElementById("themeToggle");
+    if (btn) {
+      btn.addEventListener("click", () => {
+        const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        localStorage.setItem(THEME_KEY, next);
+        applyTheme(next);
+      });
+    }
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if (!storedTheme()) applyTheme(systemTheme());
+    });
+  }
 
   function initChatList() {
     const filter = document.getElementById("filter");
@@ -362,6 +397,7 @@
     });
   }
 
+  initTheme();
   initChatList();
   initDatepicker();
   initHeatmapFocus();

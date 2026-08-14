@@ -117,6 +117,19 @@ def nav_html(active):
     return f'<nav class="nav">{links}</nav>'
 
 
+THEME_BOOT = (
+    "<script>(function(){var t=localStorage.getItem('theme');"
+    "if(t!=='light'&&t!=='dark')t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';"
+    "document.documentElement.dataset.theme=t;"
+    "document.documentElement.style.colorScheme=t})();</script>"
+)
+
+THEME_TOGGLE = """<button type="button" class="theme-toggle" id="themeToggle" aria-label="Switch to dark mode" aria-pressed="false">
+<span class="theme-icon theme-icon-moon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 14.5A8.5 8.5 0 1 1 9.5 3 7 7 0 0 0 21 14.5z"/></svg></span>
+<span class="theme-icon theme-icon-sun" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg></span>
+</button>"""
+
+
 def search_form_html(action, query="", placeholder="Search messages…", wide=False):
     cls = "search-form search-form-wide" if wide else "search-form"
     return (
@@ -137,13 +150,14 @@ def page(title, body, *, active="chats", header_left=None, header_right="", body
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{THEME_BOOT}
 <title>{html.escape(title)}</title>
 <link rel="stylesheet" href="{asset_url("app.css")}">
 </head>
 <body class="{html.escape(body_class)}"{data_chat}>
 <header class="topbar">
 <div class="topbar-left">{left}</div>
-<div class="topbar-right">{header_right}</div>
+<div class="topbar-right">{header_right}{THEME_TOGGLE}</div>
 </header>
 {body}
 <script src="{asset_url("app.js")}" defer></script>
@@ -236,9 +250,6 @@ def render_message_blocks(
     return "".join(blocks)
 
 
-HEATMAP_COLORS = ["#e6eaf1", "#c5dbf8", "#7eb6f0", "#3b8ee0", "#0a64c8"]
-
-
 def build_heatmap_html(conn, chat_id=None):
     if chat_id is not None:
         counts = conn.execute(
@@ -312,16 +323,16 @@ def build_heatmap_html(conn, chat_id=None):
                 cell_html_parts.append('<div class="hcell"></div>')
                 continue
             c = day_counts.get(day_str, 0)
-            color = HEATMAP_COLORS[bucket(c)]
+            level = bucket(c)
             title = f"{day_str}: {c} message{'s' if c != 1 else ''}"
             clickable = c and chat_id is not None
             onclick = f' onclick="location.href=\'/chat/{chat_id}?date={day_str}\'"' if clickable else ""
             cls = "hcell clickable" if clickable else "hcell"
             cell_html_parts.append(
-                f'<div class="{cls}" data-day="{day_str}" style="background:{color}" title="{title}"{onclick}></div>'
+                f'<div class="{cls} heat-{level}" data-day="{day_str}" title="{title}"{onclick}></div>'
             )
 
-    legend = "".join(f'<div class="hcell" style="background:{c}"></div>' for c in HEATMAP_COLORS)
+    legend = "".join(f'<div class="hcell heat-{i}"></div>' for i in range(5))
     return f"""<div class="heatmap-card"><div class="heatmap">
 <div class="heatmap-dow"><span></span><span></span><span>M</span><span></span><span>W</span><span></span><span>F</span><span></span></div>
 <div class="heatmap-wrap"><div class="heatmap-scroll">
@@ -1024,8 +1035,8 @@ def render_trend_chart(monthly):
 
     svg = f"""<div class="trendwrap"><svg viewBox="0 0 {W} {H}" class="trendsvg" id="trendsvg" preserveAspectRatio="none">
 <defs><linearGradient id="areaFill" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0%" stop-color="#0a84ff" stop-opacity="0.28"/>
-<stop offset="100%" stop-color="#0a84ff" stop-opacity="0.02"/>
+<stop offset="0%" stop-color="var(--signal)" stop-opacity="0.28"/>
+<stop offset="100%" stop-color="var(--signal)" stop-opacity="0.02"/>
 </linearGradient></defs>
 {''.join(grid)}
 <line x1="{pad_l}" y1="{y0:.1f}" x2="{W - pad_r}" y2="{y0:.1f}" class="axisline"></line>
