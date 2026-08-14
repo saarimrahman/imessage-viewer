@@ -21,6 +21,7 @@ import json
 import mimetypes
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -58,6 +59,7 @@ from render import (
     render_message_blocks,
     render_search,
     render_stats,
+    is_time_break,
 )
 from search import ensure_indexes, kick_search_index
 
@@ -190,12 +192,12 @@ class Handler(BaseHTTPRequestHandler):
         after_date, after_id = take("after_date"), take("after_id")
         before_date, before_id = take("before_date"), take("before_id")
         conn = get_conn()
-        prev_day = prev_sender = next_day = next_sender = None
+        prev_day = prev_sender = prev_date = next_day = next_sender = next_date = None
         strip_group_start = False
 
         if before_date is not None and before_id is not None:
             rows = fetch_messages(conn, chat_id, before=(before_date, before_id), limit=PAGE_SIZE)
-            next_day, next_sender = sender_context(conn, before_id)
+            next_day, next_sender, next_date = sender_context(conn, before_id)
             has_more_older = len(rows) == PAGE_SIZE
             has_more_newer = True
             if rows and next_sender is not None:
@@ -203,10 +205,11 @@ class Handler(BaseHTTPRequestHandler):
                 strip_group_start = (
                     apple_date(last["date"])[:10] == next_day
                     and (last["is_from_me"], last["handle"]) == next_sender
+                    and not is_time_break(last["date"], next_date)
                 )
         elif after_date is not None and after_id is not None:
             rows = fetch_messages(conn, chat_id, after=(after_date, after_id), limit=PAGE_SIZE)
-            prev_day, prev_sender = sender_context(conn, after_id)
+            prev_day, prev_sender, prev_date = sender_context(conn, after_id)
             has_more_newer = len(rows) == PAGE_SIZE
             has_more_older = True
         else:
@@ -223,8 +226,10 @@ class Handler(BaseHTTPRequestHandler):
             reactions_by_guid,
             prev_day=prev_day,
             prev_sender=prev_sender,
+            prev_date=prev_date,
             next_day=next_day,
             next_sender=next_sender,
+            next_date=next_date,
         )
         conn.close()
         self._send_json(
@@ -361,8 +366,9 @@ def serve(rebuild=False):
     except DbUnavailable as e:
         print(e)
     kick_search_index(force=rebuild)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Serving on http://127.0.0.1:{PORT}/")
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    lan_ip = socket.gethostbyname(socket.gethostname())
+    print(f"Serving on http://127.0.0.1:{PORT}/ and http://{lan_ip}:{PORT}/")
     server.serve_forever()
 
 

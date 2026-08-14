@@ -255,8 +255,8 @@ def sender_context(conn, rowid):
         (rowid,),
     ).fetchone()
     if not r:
-        return None, None
-    return apple_date(r["date"])[:10], (r["is_from_me"], r["handle"])
+        return None, None, None
+    return apple_date(r["date"])[:10], (r["is_from_me"], r["handle"]), r["date"]
 
 
 def has_neighbor(conn, chat_id, date_ns, rowid, direction):

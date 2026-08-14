@@ -106,6 +106,19 @@ def format_time(ns):
     return t[:-3] + t[-2:].lower()
 
 
+# iMessage puts a centered timestamp in the thread after about an hour of
+# silence. Same rule here: it is display-only, not stored on the message.
+TIME_BREAK_NS = 60 * 60 * 1_000_000_000
+
+
+def is_time_break(prev_ns, curr_ns):
+    return prev_ns is not None and curr_ns is not None and curr_ns - prev_ns >= TIME_BREAK_NS
+
+
+def _time_sep(ns):
+    return f'<div class="timeSep">{format_time(ns)}</div>'
+
+
 def asset_url(name):
     path = os.path.join(SCRIPT_DIR, "static", name)
     try:
@@ -196,7 +209,7 @@ def page(title, body, *, active="chats", header_left=None, header_right="", body
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {HEAD_BOOT}
 <title>{html.escape(title)}</title>
 <link rel="stylesheet" href="{asset_url("app.css")}">
@@ -205,7 +218,8 @@ def page(title, body, *, active="chats", header_left=None, header_right="", body
 {db_banner_html()}
 <header class="topbar">
 <div class="topbar-left">{left}</div>
-<div class="topbar-right">{header_right}{THEME_TOGGLE}</div>
+<div class="topbar-right">{header_right}</div>
+{THEME_TOGGLE}
 </header>
 {body}
 <script src="{asset_url("app.js")}" defer></script>
@@ -241,21 +255,44 @@ def render_message_blocks(
     highlight_id=None,
     prev_day=None,
     prev_sender=None,
+    prev_date=None,
     next_day=None,
     next_sender=None,
+    next_date=None,
 ):
     reactions_by_guid = reactions_by_guid or {}
     blocks = []
     n = len(rows)
+    open_day = None
+
+    def close_day():
+        nonlocal open_day
+        if open_day is not None:
+            blocks.append("</div>")
+            open_day = None
+
+    def ensure_day(day):
+        nonlocal open_day
+        if open_day == day:
+            return
+        close_day()
+        blocks.append(f'<div class="day" data-day="{day}">')
+        open_day = day
+        # Skip the pill when this day already has one in the loaded thread
+        # (older page) or in the previous page (newer page).
+        if day != prev_day and (next_day is None or day != next_day):
+            blocks.append(f'<div class="dateSep">{format_day_label(day)}</div>')
 
     for idx, r in enumerate(rows):
         day = apple_date(r["date"])[:10]
         sender_key = (r["is_from_me"], r["handle"])
+        ensure_day(day)
 
         if day != prev_day:
-            if next_day is None or day != next_day:
-                blocks.append(f'<div class="dateSep">{format_day_label(day)}</div>')
             prev_day = day
+            prev_sender = None
+        elif is_time_break(prev_date, r["date"]):
+            blocks.append(_time_sep(r["date"]))
             prev_sender = None
 
         next_row = rows[idx + 1] if idx + 1 < n else None
@@ -263,9 +300,14 @@ def render_message_blocks(
             next_same_group = (
                 (next_row["is_from_me"], next_row["handle"]) == sender_key
                 and apple_date(next_row["date"])[:10] == day
+                and not is_time_break(r["date"], next_row["date"])
             )
         elif next_sender is not None:
-            next_same_group = next_sender == sender_key and next_day == day
+            next_same_group = (
+                next_sender == sender_key
+                and next_day == day
+                and not is_time_break(r["date"], next_date)
+            )
         else:
             next_same_group = False
         is_last_in_group = not next_same_group
@@ -315,6 +357,15 @@ def render_message_blocks(
             f'<div class="row {who}{group_cls}{highlight_cls}{tapback_cls}" id="msg-{r["id"]}">{"".join(parts)}</div>'
         )
         prev_sender = sender_key
+        prev_date = r["date"]
+    if (
+        rows
+        and next_day is not None
+        and apple_date(rows[-1]["date"])[:10] == next_day
+        and is_time_break(rows[-1]["date"], next_date)
+    ):
+        blocks.append(_time_sep(next_date))
+    close_day()
     return "".join(blocks)
 
 
@@ -675,6 +726,33 @@ function armObservers() {{
   if (hasNewer) newerObs.observe(sentinel);
 }}
 
+function daySep(el) {{
+  const first = el.firstElementChild;
+  return first && first.classList.contains('dateSep') ? first : null;
+}}
+
+function mergeAdjacentDays() {{
+  const days = Array.from(wrap.children).filter((el) => el.classList.contains('day'));
+  for (let i = 1; i < days.length; i++) {{
+    const prev = days[i - 1];
+    const cur = days[i];
+    if (prev.dataset.day !== cur.dataset.day) continue;
+    const sep = daySep(cur) || daySep(prev);
+    const frag = document.createDocumentFragment();
+    Array.from(prev.childNodes).forEach((n) => {{
+      if (n.nodeType === 1 && n.classList.contains('dateSep')) return;
+      frag.appendChild(n);
+    }});
+    if (sep) {{
+      if (sep.parentNode !== cur) cur.prepend(sep);
+      sep.after(frag);
+    }} else {{
+      cur.prepend(frag);
+    }}
+    prev.remove();
+  }}
+}}
+
 function isNear(el) {{
   const r = el.getBoundingClientRect();
   return r.top < window.innerHeight + 600 && r.bottom > -600;
@@ -691,6 +769,7 @@ async function loadNewer() {{
   const data = await res.json();
   if (data.html) {{
     wrap.insertAdjacentHTML('beforeend', data.html);
+    mergeAdjacentDays();
     lastDate = data.last_date;
     lastId = data.last_id;
   }}
@@ -711,6 +790,7 @@ async function loadOlder() {{
   const data = await res.json();
   if (data.html) {{
     wrap.insertAdjacentHTML('afterbegin', data.html);
+    mergeAdjacentDays();
     firstDate = data.first_date;
     firstId = data.first_id;
     if (data.strip_group_start) {{
