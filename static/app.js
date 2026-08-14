@@ -126,6 +126,51 @@
     });
   }
 
+  function initTileDurations() {
+    // One capture-phase listener, because "loadedmetadata" does not bubble and
+    // a grid holds thousands of tiles.
+    document.addEventListener(
+      "loadedmetadata",
+      (e) => {
+        const video = e.target;
+        if (!video.parentElement) return;
+        const out = video.parentElement.querySelector(".tile-dur");
+        if (!out || !isFinite(video.duration)) return;
+        const total = Math.round(video.duration);
+        const secs = total % 60;
+        out.textContent = Math.floor(total / 60) + ":" + String(secs).padStart(2, "0");
+      },
+      true
+    );
+  }
+
+  function initMediaSize() {
+    const seg = document.getElementById("mediaSize");
+    if (!seg) return;
+    const root = document.documentElement;
+
+    // The grid reflows on a size change. Hold the month that the reader looks
+    // at, so the view does not jump to another year.
+    function anchor() {
+      for (const sec of document.querySelectorAll(".media-month")) {
+        const top = sec.getBoundingClientRect().top;
+        if (top > -sec.offsetHeight + 40) return { sec, top };
+      }
+      return null;
+    }
+
+    seg.querySelectorAll('input[name="mediasize"]').forEach((el) => {
+      el.checked = el.value === (root.dataset.mediasize || "m");
+      el.addEventListener("change", () => {
+        const held = anchor();
+        localStorage.setItem("mediasize", el.value);
+        root.dataset.mediasize = el.value;
+        if (held) window.scrollTo(0, held.sec.offsetTop - held.top);
+        window.dispatchEvent(new Event("resize"));
+      });
+    });
+  }
+
   function initMediaRail() {
     const sections = Array.from(document.querySelectorAll(".media-month"));
     const rail = document.getElementById("mediaRail");
@@ -402,6 +447,8 @@
   initDatepicker();
   initHeatmapFocus();
   initCountup();
+  initTileDurations();
+  initMediaSize();
   initMediaRail();
   initChatRail();
   initLightbox();
