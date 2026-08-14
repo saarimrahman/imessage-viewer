@@ -1,7 +1,7 @@
 import unittest
 from collections import Counter
 
-from voice import frequent_phrases, phrase_counts
+from voice import _tokenize, frequent_phrases, phrase_counts
 
 
 class PhraseCountsTest(unittest.TestCase):
@@ -35,6 +35,25 @@ class PhraseCountsTest(unittest.TestCase):
         self.assertEqual(counts["see you"], 1)
         self.assertNotIn("you in the", counts)
         self.assertNotIn("in the morning", counts)
+
+    def test_skips_grammar_edges(self):
+        counts = phrase_counts(
+            ["can", "get", "that", "would", "be", "going", "to", "be", "or", "some", "shit"],
+            min_n=2,
+            max_n=3,
+        )
+
+        self.assertNotIn("can get", counts)
+        self.assertNotIn("that would be", counts)
+        self.assertNotIn("going to be", counts)
+        self.assertNotIn("or some shit", counts)
+        self.assertEqual(counts["some shit"], 1)
+
+    def test_keeps_phrases_that_start_with_for(self):
+        counts = phrase_counts(["for", "sure", "figure", "it", "out"], min_n=2, max_n=3)
+
+        self.assertEqual(counts["for sure"], 1)
+        self.assertEqual(counts["figure it out"], 1)
 
 
 class FrequentPhrasesTest(unittest.TestCase):
@@ -88,3 +107,27 @@ class FrequentPhrasesTest(unittest.TestCase):
 
         self.assertIn("see you later", phrases)
         self.assertEqual(len(phrases), 10)
+
+    def test_drops_longer_phrase_that_only_adds_filler(self):
+        ranked = frequent_phrases(
+            Counter({"thank you": 40, "thank you for": 8, "some shit": 20, "or some shit": 10}),
+            stop={"you", "for", "or", "some"},
+            min_count=3,
+        )
+        phrases = [item["phrase"] for item in ranked]
+
+        self.assertEqual(phrases, ["thank you", "some shit"])
+
+    def test_drops_light_verb_glue(self):
+        ranked = frequent_phrases(
+            Counter({"need to get": 33, "can get": 20, "pull up": 20}),
+            stop={"to", "can", "up"},
+            min_count=3,
+        )
+
+        self.assertEqual([item["phrase"] for item in ranked], ["pull up"])
+
+
+class TokenizeTest(unittest.TestCase):
+    def test_strips_emails(self):
+        self.assertEqual(_tokenize("email me at saarimmm@gmail.com later"), ["email", "me", "at", "later"])

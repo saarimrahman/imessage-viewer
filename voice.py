@@ -14,11 +14,19 @@ from contacts import resolve_contact
 
 TOKEN = re.compile(r"[a-z][a-z']{1,}")
 URL = re.compile(r"https?://\S+|www\.\S+")
-PHRASE_SKIP = frozenset("to of a an the and is it its we as in on at".split())
-# Unpunctuated forms NLTK's list does not cover.
+EMAIL = re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b")
+# Cannot start or end a phrase. Keep for/you/out/down/no/all/some — those
+# make real phrases like "for sure", "thank you", "figure it out".
+PHRASE_SKIP = frozenset(
+    "to of a an the and is it its we as in on at be can will would could or "
+    "if that this but not what when how did was were have has had me".split()
+)
+# Light verbs are not enough on their own to make a phrase ("can get").
+PHRASE_WEAK = frozenset("get got go going come make take need want".split())
+# Unpunctuated forms and function words NLTK's English list does not cover.
 SMS_STOP = frozenset(
     "im ive id ill youre thats dont doesnt didnt cant wont theyre weve youve "
-    "gonna wanna gotta ur".split()
+    "gonna wanna gotta ur would could also us".split()
 )
 MIN_PERSON_MSGS = 80
 TOP_WORDS = 80
@@ -50,6 +58,7 @@ def _stopwords():
 
 def _tokenize(text):
     text = URL.sub(" ", (text or "").lower().replace("\u2019", "'"))
+    text = EMAIL.sub(" ", text)
     return [t.replace("'", "") for t in TOKEN.findall(text) if t.replace("'", "")]
 
 
@@ -79,9 +88,22 @@ def _token_subspan(short, long_tokens):
     return False
 
 
+def _only_weak_wings(core, toks, weak):
+    """True when toks is core with only function words added on either side."""
+    n = len(core)
+    if n >= len(toks):
+        return False
+    for i in range(len(toks) - n + 1):
+        if toks[i : i + n] != core:
+            continue
+        wings = toks[:i] + toks[i + n :]
+        return bool(wings) and all(t in weak for t in wings)
+    return False
+
+
 def frequent_phrases(counts, stop=(), limit=TOP_PHRASES, min_count=MIN_PHRASE_COUNT):
     """Rank frequent phrases of any length. Drop a short phrase when longer ones cover it."""
-    weak = set(stop) | PHRASE_SKIP
+    weak = set(stop) | PHRASE_SKIP | PHRASE_WEAK
     items = []
     for phrase, n in counts.items():
         if n < min_count:
@@ -97,8 +119,14 @@ def frequent_phrases(counts, stop=(), limit=TOP_PHRASES, min_count=MIN_PHRASE_CO
         if n - explained < min_count:
             continue
         kept.append((toks, phrase, n))
-    two = [x for x in kept if len(x[0]) == 2]
-    longer = [x for x in kept if len(x[0]) >= 3]
+    kept.sort(key=lambda x: (len(x[0]), -x[2]))
+    cores = []
+    for toks, phrase, n in kept:
+        if any(_only_weak_wings(ct, toks, weak) for ct, _, _ in cores):
+            continue
+        cores.append((toks, phrase, n))
+    two = [x for x in cores if len(x[0]) == 2]
+    longer = [x for x in cores if len(x[0]) >= 3]
     two.sort(key=lambda x: (-x[2], x[1]))
     longer.sort(key=lambda x: (-x[2] * len(x[0]), -x[2], x[1]))
     n_two = min(len(two), limit // 2)

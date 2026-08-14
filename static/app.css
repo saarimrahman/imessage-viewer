@@ -26,6 +26,10 @@
   --heat-2: #7eb6f0;
   --heat-3: #3b8ee0;
   --heat-4: #0a64c8;
+  /* Diverging pair for the drift chart. Validated for CVD separation and
+     contrast against the light surface. Dark mode gets its own warm step. */
+  --rise: #0a84ff;
+  --fade: #c2410c;
   --select-caret: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none'><path d='M1 1.5 6 6.5 11 1.5' stroke='%236b7382' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   --radius: 12px;
   --radius-lg: 16px;
@@ -72,6 +76,8 @@ html[data-theme="dark"] {
   --heat-2: #1a5a9a;
   --heat-3: #2b7fd4;
   --heat-4: #5bb0ff;
+  --rise: #0a84ff;
+  --fade: #cf7a2a;
   --select-caret: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none'><path d='M1 1.5 6 6.5 11 1.5' stroke='%238d94a1' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   --shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
   --shadow-hover: 0 0 0 1px rgba(255, 255, 255, 0.13);
@@ -1103,7 +1109,6 @@ mark {
 }
 
 .trendsvg { width: 100%; height: 240px; overflow: visible; display: block; }
-.streamsvg { height: 280px; }
 .axisline { stroke: var(--line); stroke-width: 1; }
 .gridline { stroke: var(--line); stroke-width: 1; }
 .axislabel { font-size: 10px; font-weight: 600; fill: var(--faint); }
@@ -1128,31 +1133,93 @@ mark {
   transition-duration: 120ms;
 }
 
-.sg-band { opacity: 0.9; transition-property: opacity; transition-duration: 150ms; }
-.sg-band.dim { opacity: 0.12; }
-.sg-band.hot { opacity: 1; }
+.drift { padding: 8px 16px 12px; }
 
-.sg-legend { display: flex; flex-wrap: wrap; gap: 6px 8px; margin-top: 12px; }
+.dr-group { display: flex; padding: 14px 0 6px; }
+.dr-group:first-child { padding-top: 4px; }
 
-.sg-leg {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--ink-soft);
-  cursor: default;
-  min-height: 32px;
-  padding: 0 10px 0 8px;
+.dr-tag {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
   border-radius: 999px;
-  background: var(--surface-2);
-  transition-property: background-color, color;
+  color: var(--surface);
+}
+
+.dr-tag.up { background: var(--rise); }
+.dr-tag.down { background: var(--fade); }
+
+.dr-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 8px;
+  margin: 0 -8px 2px;
+  border-radius: 8px;
+  color: inherit;
+  text-decoration: none;
+  transition-property: background-color;
   transition-duration: 150ms;
 }
 
-.sg-leg:hover { background: var(--them); color: var(--ink); }
-.sg-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.sg-tip { white-space: pre; }
+a.dr-row:hover { background: var(--hover); }
+
+.dr-name {
+  flex: 0 0 clamp(90px, 22%, 150px);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dr-plot { position: relative; flex: 1 1 auto; min-width: 0; }
+.dr-spark { display: block; width: 100%; height: 34px; overflow: visible; }
+.dr-spark.up { --tone: var(--rise); }
+.dr-spark.down { --tone: var(--fade); }
+.dr-area { fill: var(--tone); opacity: 0.1; stroke: none; }
+.dr-line { fill: none; stroke: var(--tone); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.dr-cut { stroke: var(--faint); stroke-width: 1; opacity: 0.45; }
+
+.dr-num {
+  flex: 0 0 62px;
+  text-align: right;
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.dr-num.up { color: var(--rise); }
+.dr-num.down { color: var(--fade); }
+.dr-unit { font-size: 10px; font-weight: 600; color: var(--faint); margin-left: 2px; }
+
+.dr-axis { min-height: 22px; }
+.dr-axis .dr-plot { height: 14px; }
+
+.dr-ax-l, .dr-ax-c, .dr-ax-r {
+  position: absolute;
+  top: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.dr-ax-l { left: 0; }
+.dr-ax-c { transform: translateX(-50%); }
+.dr-ax-r { right: 0; }
+
+.dr-table { margin-top: 16px; font-size: 12px; }
+.dr-table summary { cursor: pointer; color: var(--muted); font-weight: 600; }
+.dr-table table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+.dr-table th, .dr-table td { padding: 5px 8px; text-align: right; border-bottom: 1px solid var(--line); }
+.dr-table th:first-child, .dr-table td:first-child { text-align: left; }
+.dr-table th { color: var(--muted); font-weight: 600; }
+.dr-table td { color: var(--ink-soft); font-variant-numeric: tabular-nums; }
 
 .wordcloud {
   display: flex;

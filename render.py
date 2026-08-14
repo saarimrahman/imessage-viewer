@@ -38,13 +38,15 @@ from search import (
     snippet_html,
 )
 from stats import (
+    DRIFT_WINDOW_MONTHS,
     FELL_OFF_MIN_COUNT,
     FELL_OFF_MIN_GAP_DAYS,
     LONG_TERM_MAX_GAP_DAYS,
     LONG_TERM_MIN_SPAN_DAYS,
-    STREAM_COLORS,
     compute_contact_stats,
+    monthly_by_person,
     monthly_counts,
+    people_drift,
     people_over_time,
 )
 from voice import load_voice
@@ -1089,102 +1091,109 @@ def render_trend_chart(monthly):
     return svg + f"<script>{script}</script>"
 
 
-def render_people_stream(series, months):
-    if not series or not months:
-        return '<p class="empty">No data.</p>'
-    W, H = 900, 280
-    pad_l, pad_r, pad_t, pad_b = 12, 12, 12, 28
-    plot_w = W - pad_l - pad_r
-    plot_h = H - pad_t - pad_b
-    n = len(months)
-    col_w = plot_w / n
-    xs = [pad_l + col_w * (i + 0.5) for i in range(n)]
-    totals = [sum(s["values"][i] for s in series) for i in range(n)]
-    max_total = max(totals) or 1
-    scale = plot_h / max_total
-    y_mid = pad_t + plot_h / 2
+DRIFT_W, DRIFT_H = 240, 34
 
-    bands = []
-    baselines = [y_mid - t * scale / 2 for t in totals]
-    for si, s in enumerate(series):
-        y_top = []
-        y_bot = []
-        for i, v in enumerate(s["values"]):
-            y_bot.append(baselines[i])
-            y_top.append(baselines[i] + v * scale)
-            baselines[i] += v * scale
-        top_d = " ".join(f"{'M' if i == 0 else 'L'} {xs[i]:.1f} {y_top[i]:.1f}" for i in range(n))
-        bot_d = " ".join(f"L {xs[i]:.1f} {y_bot[i]:.1f}" for i in range(n - 1, -1, -1))
-        color = STREAM_COLORS[si % len(STREAM_COLORS)]
-        bands.append(
-            f'<path class="sg-band" data-i="{si}" fill="{color}" d="{top_d} {bot_d} Z"></path>'
-        )
 
-    hit_cols = []
-    x_labels = []
-    seen_years = set()
-    for i, ym in enumerate(months):
-        year = ym[:4]
-        if (ym[5:7] == "01" or i == 0) and year not in seen_years:
-            seen_years.add(year)
-            x_labels.append(f'<text x="{xs[i]:.1f}" y="{H - 6}" class="axislabel">{year}</text>')
-        payload = [
-            {"name": s["name"], "c": s["values"][i]}
-            for s in series
-            if s["values"][i]
-        ]
-        payload.sort(key=lambda x: -x["c"])
-        hit_cols.append(
-            f'<rect class="hitcol" x="{pad_l + col_w * i:.1f}" y="{pad_t}" width="{col_w:.1f}" height="{plot_h}" '
-            f'data-label="{ym}" data-cx="{xs[i]:.1f}" data-people="{html.escape(json.dumps(payload), quote=True)}"></rect>'
-        )
-
-    legend = "".join(
-        f'<div class="sg-leg" data-i="{i}">'
-        f'<span class="sg-dot" style="background:{STREAM_COLORS[i % len(STREAM_COLORS)]}"></span>'
-        f'{html.escape(s["name"])}</div>'
-        for i, s in enumerate(series)
+def drift_spark(person, months, window, tone):
+    """One row of the small-multiple chart, scaled to this person's own peak."""
+    values = person["values"]
+    n = len(values)
+    top = max(values) or 1
+    step = DRIFT_W / (n - 1) if n > 1 else DRIFT_W
+    xs = [i * step for i in range(n)]
+    ys = [DRIFT_H - 1.5 - (v / top) * (DRIFT_H - 3) for v in values]
+    line = " ".join(f"{'M' if i == 0 else 'L'} {xs[i]:.1f} {ys[i]:.1f}" for i in range(n))
+    area = f"{line} L {xs[-1]:.1f} {DRIFT_H} L 0 {DRIFT_H} Z"
+    cut = window * step
+    hits = "".join(
+        f'<rect class="hitcol" x="{xs[i] - step / 2:.1f}" y="0" width="{step:.1f}" height="{DRIFT_H}" '
+        f'data-label="{month_label(months[i])}" data-c="{values[i]}" data-cx="{xs[i]:.1f}"></rect>'
+        for i in range(n)
+    )
+    return (
+        f'<svg class="dr-spark {tone}" viewBox="0 0 {DRIFT_W} {DRIFT_H}" preserveAspectRatio="none" '
+        f'role="img" aria-label="{html.escape(person["name"])} monthly messages">'
+        f'<path class="dr-area" d="{area}"></path>'
+        f'<path class="dr-line" d="{line}" vector-effect="non-scaling-stroke"></path>'
+        f'<line class="dr-cut" x1="{cut:.1f}" y1="0" x2="{cut:.1f}" y2="{DRIFT_H}"></line>'
+        f'{hits}</svg>'
     )
 
-    svg = f"""<div class="trendwrap"><svg viewBox="0 0 {W} {H}" class="trendsvg streamsvg" id="streamsvg" preserveAspectRatio="none">
-{''.join(bands)}
-{''.join(x_labels)}
-{''.join(hit_cols)}
-</svg><div class="trendtip sg-tip" id="streamtip"></div>
-<div class="sg-legend">{legend}</div></div>"""
 
-    script = """
-(function() {
-  const svg = document.getElementById('streamsvg');
-  if (!svg) return;
-  const tip = document.getElementById('streamtip');
-  const bands = svg.querySelectorAll('.sg-band');
-  svg.querySelectorAll('.hitcol').forEach(col => {
-    col.addEventListener('mouseenter', () => {
-      const box = svg.getBoundingClientRect();
-      const people = JSON.parse(col.dataset.people || '[]');
-      const lines = people.slice(0, 6).map(p => p.name + ': ' + p.c.toLocaleString());
-      tip.style.left = (parseFloat(col.dataset.cx) * box.width / __W__) + 'px';
-      tip.style.top = '20px';
-      tip.textContent = col.dataset.label + (lines.length ? '\\n' + lines.join('\\n') : '');
+def drift_rows(group, months, window, tone):
+    rows = []
+    for person in group:
+        name = html.escape(person["name"])
+        inner = (
+            f'<span class="dr-name">{name}</span>'
+            f'<span class="dr-plot">{drift_spark(person, months, window, tone)}</span>'
+            f'<span class="dr-num {tone}">{person["drift"] * 100:+.1f}<span class="dr-unit">pts</span></span>'
+        )
+        if person["chat_id"]:
+            rows.append(f'<a class="dr-row" href="/chat/{person["chat_id"]}">{inner}</a>')
+        else:
+            rows.append(f'<div class="dr-row">{inner}</div>')
+    return "".join(rows)
+
+
+def drift_table(rising, faded, window):
+    body = "".join(
+        f'<tr><td>{html.escape(p["name"])}</td><td>{p["prev"]:,}</td><td>{p["recent"]:,}</td>'
+        f'<td>{p["share_prev"] * 100:.1f}%</td><td>{p["share_now"] * 100:.1f}%</td>'
+        f'<td>{p["drift"] * 100:+.1f}</td></tr>'
+        for p in list(rising) + list(faded)
+    )
+    return (
+        f'<details class="dr-table"><summary>Table view</summary><table>'
+        f"<thead><tr><th>Person</th><th>Prior {window} mo</th><th>Last {window} mo</th>"
+        f"<th>Share before</th><th>Share now</th><th>Shift</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></details>"
+    )
+
+
+def render_people_drift(rising, faded, months, window):
+    if not rising and not faded:
+        return '<p class="empty">Not enough history yet to compare two years.</p>'
+    cut_pct = 100 * window / (len(months) - 1)
+    groups = ""
+    if rising:
+        groups += (
+            '<div class="dr-group"><span class="dr-tag up">Drifting toward</span></div>'
+            + drift_rows(rising, months, window, "up")
+        )
+    if faded:
+        groups += (
+            '<div class="dr-group"><span class="dr-tag down">Drifting away</span></div>'
+            + drift_rows(faded, months, window, "down")
+        )
+    return f"""<div class="trendwrap drift">
+{groups}
+<div class="dr-row dr-axis"><span class="dr-name"></span><span class="dr-plot">
+<span class="dr-ax-l">{month_label(months[0])}</span>
+<span class="dr-ax-c" style="left:{cut_pct:.2f}%">{month_label(months[window])}</span>
+<span class="dr-ax-r">{month_label(months[-1])}</span>
+</span><span class="dr-num"></span></div>
+{drift_table(rising, faded, window)}
+<div class="trendtip dr-tip" id="drifttip"></div>
+</div>
+<script>
+(function() {{
+  const tip = document.getElementById('drifttip');
+  if (!tip) return;
+  const wrap = tip.parentElement;
+  document.querySelectorAll('.dr-spark .hitcol').forEach(col => {{
+    col.addEventListener('mouseenter', () => {{
+      const svg = col.ownerSVGElement, box = svg.getBoundingClientRect();
+      const wbox = wrap.getBoundingClientRect();
+      tip.textContent = col.dataset.label + ' · ' + (+col.dataset.c).toLocaleString() + ' messages';
+      tip.style.left = (box.left - wbox.left + col.dataset.cx * box.width / {DRIFT_W}) + 'px';
+      tip.style.top = (box.top - wbox.top) + 'px';
       tip.style.opacity = 1;
-    });
-    col.addEventListener('mouseleave', () => { tip.style.opacity = 0; });
-  });
-  document.querySelectorAll('.sg-leg').forEach(leg => {
-    leg.addEventListener('mouseenter', () => {
-      const i = leg.dataset.i;
-      bands.forEach(b => b.classList.toggle('dim', b.dataset.i !== i));
-      bands.forEach(b => b.classList.toggle('hot', b.dataset.i === i));
-    });
-    leg.addEventListener('mouseleave', () => {
-      bands.forEach(b => b.classList.remove('dim', 'hot'));
-    });
-  });
-})();
-""".replace("__W__", str(W)).replace("__H__", str(H))
-
-    return svg + f"<script>{script}</script>"
+    }});
+    col.addEventListener('mouseleave', () => {{ tip.style.opacity = 0; }});
+  }});
+}})();
+</script>"""
 
 
 def render_word_cloud(words):
@@ -1262,9 +1271,11 @@ def render_stats():
 
     contacts = compute_contact_stats(conn)
     monthly = monthly_counts(conn)
-    stream_series, stream_months = people_over_time(
+    people, all_months = monthly_by_person(
         conn, chat_per={c["handle"]: c["chat_id"] for c in contacts}
     )
+    stream_series = people_over_time(people, all_months)
+    rising, faded, drift_months = people_drift(people, all_months)
     heatmap_html = build_heatmap_html(conn)
     conn.close()
 
@@ -1327,11 +1338,12 @@ def render_stats():
 {render_voice_section({c["handle"]: c["chat_id"] for c in contacts})}
 
 <h2 class="section-h">People fading in and out</h2>
-<p class="section-sub">Monthly messages from your {len(stream_series)} most-texted people. Hover a name to isolate them.</p>
-{render_people_stream(stream_series, stream_months)}
+<p class="section-sub">Share of everything you received, last {DRIFT_WINDOW_MONTHS} months against the {DRIFT_WINDOW_MONTHS} before.
+Share, not raw count, because your total volume kept growing. Each line is scaled to its own peak.</p>
+{render_people_drift(rising, faded, drift_months, DRIFT_WINDOW_MONTHS)}
 
 <h2 class="section-h">When you were closest</h2>
-<p class="section-sub">The single busiest month with each of those people.</p>
+<p class="section-sub">The single busiest month with each of your {len(stream_series)} most-texted people.</p>
 {peak_html}
 
 <h2 class="section-h">Messages per month</h2>
