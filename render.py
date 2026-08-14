@@ -1618,6 +1618,11 @@ def render_reactions(rows):
     return f'<div class="trendwrap drift">{"".join(out)}</div>'
 
 
+def _exact_search_href(text):
+    """Search URL that quotes the term so it matches as a literal phrase."""
+    return "/search?q=" + html.escape(quote(f'"{text}"'), quote=True)
+
+
 def render_word_cloud(words):
     if not words:
         return ""
@@ -1626,9 +1631,8 @@ def render_word_cloud(words):
     for item in words:
         t = (item["n"] / max_n) ** 0.45
         size = 13 + t * 22
-        q = quote(item["word"])
         parts.append(
-            f'<a class="wc-word" href="/search?q={html.escape(q, quote=True)}" '
+            f'<a class="wc-word" href="{_exact_search_href(item["word"])}" '
             f'style="font-size:{size:.1f}px" title="{item["n"]:,} times">'
             f'{html.escape(item["word"])}</a>'
         )
@@ -1644,14 +1648,14 @@ def render_voice_section(chat_by_handle):
             '<p class="section-sub">Word stats are still building from your sent messages. Refresh this page in a moment.</p>'
         )
     phrase_html = "".join(
-        f'<a class="vchip" href="/search?q={html.escape(quote(p["phrase"]), quote=True)}">'
+        f'<a class="vchip" href="{_exact_search_href(p["phrase"])}">'
         f'{html.escape(p["phrase"])}<span class="n">{p["n"]:,}</span></a>'
         for p in voice.get("phrases") or []
     )
     people_html = []
     for p in voice.get("people") or []:
         chips = "".join(
-            f'<a class="vchip" href="/search?q={html.escape(quote(w["word"]), quote=True)}">'
+            f'<a class="vchip" href="{_exact_search_href(w["word"])}">'
             f'{html.escape(w["word"])}<span class="lift">{w["lift"]}×</span>'
             f'<span class="n">{w["n"]:,}</span></a>'
             for w in p.get("words") or []
@@ -1671,7 +1675,7 @@ def render_voice_section(chat_by_handle):
         f'<span class="n">{y["msgs"]:,} texts you sent</span></div>'
         f'<div class="vchips">'
         + "".join(
-            f'<a class="vchip" href="/search?q={html.escape(quote(w["word"]), quote=True)}">'
+            f'<a class="vchip" href="{_exact_search_href(w["word"])}">'
             f'{html.escape(w["word"])}<span class="lift">{w["lift"]}×</span>'
             f'<span class="n">{w["n"]:,}</span></a>'
             for w in y.get("words") or []
