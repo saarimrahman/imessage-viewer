@@ -123,11 +123,15 @@ def nav_html(active):
     return f'<nav class="nav">{links}</nav>'
 
 
-THEME_BOOT = (
+# Runs in the head so the theme and the tile size are set before the first
+# paint. app.js is deferred and lands too late to prevent a flash.
+HEAD_BOOT = (
     "<script>(function(){var t=localStorage.getItem('theme');"
     "if(t!=='light'&&t!=='dark')t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';"
     "document.documentElement.dataset.theme=t;"
-    "document.documentElement.style.colorScheme=t})();</script>"
+    "document.documentElement.style.colorScheme=t;"
+    "var s=localStorage.getItem('mediasize');"
+    "document.documentElement.dataset.mediasize=(s==='s'||s==='l')?s:'m'})();</script>"
 )
 
 THEME_TOGGLE = """<button type="button" class="theme-toggle" id="themeToggle" aria-label="Switch to dark mode" aria-pressed="false">
@@ -185,7 +189,7 @@ def page(title, body, *, active="chats", header_left=None, header_right="", body
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-{THEME_BOOT}
+{HEAD_BOOT}
 <title>{html.escape(title)}</title>
 <link rel="stylesheet" href="{asset_url("app.css")}">
 </head>
@@ -720,6 +724,12 @@ def short_month(ym):
     return datetime.strptime(ym, "%Y-%m").strftime("%b %Y")
 
 
+PLAY_ICON = (
+    '<svg width="8" height="9" viewBox="0 0 8 9" fill="currentColor" aria-hidden="true">'
+    '<path d="M0 0l8 4.5L0 9z"/></svg>'
+)
+
+
 def media_tile_html(a, chat_id, chat_name=None, visual_only=False):
     mime = a["mime_type"] or mimetypes.guess_type(a["filename"] or "")[0] or ""
     is_image = mime.startswith("image/") or is_heic(a["filename"] or "", mime)
@@ -732,7 +742,10 @@ def media_tile_html(a, chat_id, chat_name=None, visual_only=False):
     if is_image:
         inner = f'<img src="/thumb/{a["att_id"]}" data-full-src="/attachment/{a["att_id"]}" loading="lazy">'
     elif is_video:
-        inner = f'<video src="/attachment/{a["att_id"]}" preload="metadata" muted></video>'
+        inner = (
+            f'<video src="/attachment/{a["att_id"]}" preload="metadata" muted></video>'
+            f'<span class="tile-badge">{PLAY_ICON}<b class="tile-dur"></b></span>'
+        )
     else:
         fname = html.escape(os.path.basename(a["filename"] or "file"))
         inner = f'<div class="filetile">{fname}</div>'
@@ -744,6 +757,19 @@ def media_tile_html(a, chat_id, chat_name=None, visual_only=False):
         f'data-msg-id="{a["msg_id"]}" data-chat-id="{chat_id}">{inner}{caption}</a>'
     )
     return apple_date(a["date"])[:7], tile
+
+
+MEDIA_SIZES = (("s", "S", "Small tiles"), ("m", "M", "Medium tiles"), ("l", "L", "Large tiles"))
+
+
+def media_size_seg_html():
+    """The checked radio is set by app.js from localStorage."""
+    btns = "".join(
+        f'<label class="seg-btn" title="{title}">'
+        f'<input type="radio" name="mediasize" value="{key}"> {label}</label>'
+        for key, label, title in MEDIA_SIZES
+    )
+    return f'<div class="seg seg-sm" id="mediaSize" role="radiogroup" aria-label="Tile size">{btns}</div>'
 
 
 def media_start_script():
@@ -826,7 +852,10 @@ def render_media(chat_id):
         f"Photos: {title}",
         f'<main class="page">{section_html}</main>{rail_html}',
         header_left=header_left,
-        header_right=f'<a class="btn btn-ghost" href="/media">All photos</a><span class="muted">{len(items):,} items</span>',
+        header_right=(
+            f'{media_size_seg_html()}<a class="btn btn-ghost" href="/media">All photos</a>'
+            f'<span class="muted">{len(items):,} items</span>'
+        ),
         body_class="mediapage",
         scripts=media_start_script(),
         chat_id=chat_id,
@@ -873,7 +902,7 @@ def render_all_media():
         "Photos",
         f'<main class="page">{section_html}</main>{rail_html}',
         active="photos",
-        header_right=f'<span class="muted">{len(items):,} items</span>',
+        header_right=f'{media_size_seg_html()}<span class="muted">{len(items):,} items</span>',
         body_class="mediapage",
         scripts=media_start_script(),
     )

@@ -50,7 +50,12 @@
     0 8px 20px rgba(18, 20, 26, 0.06);
   --ease: cubic-bezier(0.2, 0, 0, 1);
   --topbar-h: 56px;
+  --tile-min: 118px;
+  --tile-gap: 6px;
 }
+
+html[data-mediasize="s"] { --tile-min: 76px; --tile-gap: 4px; }
+html[data-mediasize="l"] { --tile-min: 196px; --tile-gap: 8px; }
 
 html[data-theme="dark"] {
   color-scheme: dark;
@@ -466,6 +471,9 @@ html[data-theme="dark"] .theme-icon-sun {
   opacity: 0;
   cursor: pointer;
 }
+
+.seg-sm { padding: 3px; border-radius: 11px; }
+.seg-sm .seg-btn { min-height: 26px; padding: 0 10px; }
 
 .seg-btn:hover { color: var(--ink); }
 .seg-btn:has(input:checked) {
@@ -932,10 +940,31 @@ mark {
 
 .tile:hover .tile-chat { opacity: 1; }
 
+.tile-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.tile-dur:empty { display: none; }
+html[data-mediasize="s"] .tile-dur { display: none; }
+
 .mediagrid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(var(--tile-min), 1fr));
+  gap: var(--tile-gap);
 }
 
 .tile {
