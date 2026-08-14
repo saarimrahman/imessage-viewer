@@ -565,6 +565,8 @@ body.chatpage .page { max-width: 780px; padding-right: 56px; padding-top: 12px; 
   transition-duration: 120ms;
 }
 
+.chat-row[hidden] { display: none; }
+
 .chat-row + .chat-row { box-shadow: 0 -1px 0 var(--line); }
 
 .chat-row:hover { background: var(--hover); color: inherit; }
