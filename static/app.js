@@ -442,6 +442,63 @@
     });
   }
 
+  function initTapbacks() {
+    const pop = document.createElement("div");
+    pop.className = "tapback-pop";
+    document.body.appendChild(pop);
+    let openFor = null;
+
+    function close() {
+      pop.classList.remove("open");
+      openFor = null;
+    }
+
+    function open(btn) {
+      let detail;
+      try {
+        detail = JSON.parse(btn.dataset.detail || "[]");
+      } catch (err) {
+        return;
+      }
+      pop.innerHTML = detail
+        .map(() => '<div class="tapback-pop-row"><span class="emoji"></span><span class="who"></span><span class="verb"></span></div>')
+        .join("");
+      Array.from(pop.children).forEach((row, i) => {
+        row.querySelector(".emoji").textContent = detail[i].emoji;
+        row.querySelector(".who").textContent = detail[i].who;
+        row.querySelector(".verb").textContent = detail[i].verb;
+      });
+      pop.classList.add("open");
+      const r = btn.getBoundingClientRect();
+      const w = pop.offsetWidth;
+      const h = pop.offsetHeight;
+      let left = r.left + r.width / 2 - w / 2;
+      left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+      let top = r.bottom + 8;
+      if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 8);
+      pop.style.left = left + "px";
+      pop.style.top = top + "px";
+      openFor = btn;
+    }
+
+    document.body.addEventListener("click", (e) => {
+      const btn = e.target.closest(".tapbacks");
+      if (btn) {
+        e.preventDefault();
+        if (openFor === btn) close();
+        else open(btn);
+        return;
+      }
+      if (!pop.contains(e.target)) close();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") close();
+    });
+    window.addEventListener("scroll", close, { passive: true });
+    window.addEventListener("resize", close);
+  }
+
   initTheme();
   initChatList();
   initDatepicker();
@@ -452,4 +509,5 @@
   initMediaRail();
   initChatRail();
   initLightbox();
+  initTapbacks();
 })();
