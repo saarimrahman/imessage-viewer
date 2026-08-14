@@ -1,24 +1,62 @@
 import unittest
+from collections import Counter
 
-from voice import phrase_counts
+from voice import frequent_phrases, phrase_counts
 
 
 class PhraseCountsTest(unittest.TestCase):
     def test_counts_overlapping_trigrams(self):
         counts = phrase_counts(
             ["see", "you", "later", "see", "you", "later"],
-            size=3,
+            min_n=3,
+            max_n=3,
         )
 
         self.assertEqual(counts["see you later"], 2)
         self.assertEqual(counts["you later see"], 1)
         self.assertEqual(counts["later see you"], 1)
 
-    def test_skips_phrase_when_any_token_is_common_filler(self):
-        counts = phrase_counts(["see", "you", "in", "the", "morning"], size=3)
+    def test_counts_several_lengths(self):
+        counts = phrase_counts(["love", "you", "so", "much"], min_n=2, max_n=4)
+
+        self.assertEqual(counts["love you"], 1)
+        self.assertEqual(counts["love you so"], 1)
+        self.assertEqual(counts["love you so much"], 1)
+
+    def test_skips_phrase_that_starts_or_ends_on_filler(self):
+        counts = phrase_counts(["see", "you", "in", "the", "morning"], min_n=3, max_n=3)
 
         self.assertEqual(counts, {})
 
+    def test_keeps_longer_phrase_with_filler_inside(self):
+        counts = phrase_counts(["see", "you", "in", "the", "morning"], min_n=2, max_n=5)
 
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(counts["see you in the morning"], 1)
+        self.assertEqual(counts["see you"], 1)
+        self.assertNotIn("you in the", counts)
+        self.assertNotIn("in the morning", counts)
+
+
+class FrequentPhrasesTest(unittest.TestCase):
+    def test_drops_short_phrase_covered_by_a_longer_one(self):
+        ranked = frequent_phrases(
+            Counter({"see you later": 12, "see you": 12, "you later": 12}),
+            min_count=3,
+        )
+        phrases = [item["phrase"] for item in ranked]
+
+        self.assertEqual(phrases, ["see you later"])
+
+    def test_keeps_short_phrase_with_its_own_count(self):
+        ranked = frequent_phrases(
+            Counter({"thank you so much": 8, "thank you": 40}),
+            min_count=3,
+        )
+        phrases = [item["phrase"] for item in ranked]
+
+        self.assertEqual(phrases, ["thank you", "thank you so much"])
+
+    def test_ignores_phrases_below_min_count(self):
+        ranked = frequent_phrases(Counter({"rare bird": 2}), min_count=3)
+
+        self.assertEqual(ranked, [])

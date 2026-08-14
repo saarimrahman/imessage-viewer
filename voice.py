@@ -14,7 +14,7 @@ from contacts import resolve_contact
 
 TOKEN = re.compile(r"[a-z][a-z']{1,}")
 URL = re.compile(r"https?://\S+|www\.\S+")
-BIGRAM_SKIP = frozenset("to of a an the and is it its we as in on at".split())
+PHRASE_SKIP = frozenset("to of a an the and is it its we as in on at".split())
 # Unpunctuated forms NLTK's list does not cover.
 SMS_STOP = frozenset(
     "im ive id ill youre thats dont doesnt didnt cant wont theyre weve youve "
@@ -23,7 +23,8 @@ SMS_STOP = frozenset(
 MIN_PERSON_MSGS = 80
 TOP_WORDS = 80
 TOP_PHRASES = 20
-TOP_TRIGRAMS = 20
+MAX_PHRASE_N = 6
+MIN_PHRASE_COUNT = 3
 TOP_PEOPLE = 12
 DISTINCTIVE_PER_PERSON = 12
 
@@ -52,14 +53,48 @@ def _tokenize(text):
     return [t.replace("'", "") for t in TOKEN.findall(text) if t.replace("'", "")]
 
 
-def phrase_counts(tokens, size):
+def phrase_counts(tokens, min_n=2, max_n=MAX_PHRASE_N):
+    """Count n-grams from min_n to max_n. Skip phrases that start or end on filler."""
     counts = Counter()
-    for start in range(len(tokens) - size + 1):
-        phrase = tokens[start : start + size]
-        if any(token in BIGRAM_SKIP or len(token) < 2 for token in phrase):
-            continue
-        counts[" ".join(phrase)] += 1
+    n = len(tokens)
+    hi = min(max_n, n)
+    for size in range(min_n, hi + 1):
+        for start in range(n - size + 1):
+            phrase = tokens[start : start + size]
+            if phrase[0] in PHRASE_SKIP or phrase[-1] in PHRASE_SKIP:
+                continue
+            if any(len(token) < 2 for token in phrase):
+                continue
+            counts[" ".join(phrase)] += 1
     return counts
+
+
+def _token_subspan(short, long_tokens):
+    n = len(short)
+    if n >= len(long_tokens):
+        return False
+    for i in range(len(long_tokens) - n + 1):
+        if long_tokens[i : i + n] == short:
+            return True
+    return False
+
+
+def frequent_phrases(counts, limit=TOP_PHRASES, min_count=MIN_PHRASE_COUNT):
+    """Rank frequent phrases of any length. Drop a short phrase when longer ones cover it."""
+    items = []
+    for phrase, n in counts.items():
+        if n < min_count:
+            continue
+        items.append((phrase.split(), phrase, n))
+    items.sort(key=lambda x: (-len(x[0]), -x[2]))
+    kept = []
+    for toks, phrase, n in items:
+        explained = sum(kn for kt, _, kn in kept if _token_subspan(toks, kt))
+        if n - explained < min_count:
+            continue
+        kept.append((toks, phrase, n))
+    kept.sort(key=lambda x: (-x[2] * len(x[0]), -x[2], x[1]))
+    return [{"phrase": p, "n": n} for _, p, n in kept[:limit]]
 
 
 def _name_tokens(name):
@@ -129,8 +164,7 @@ def build_voice_stats(force=False, verbose=False):
     conn = sqlite3.connect(f"file:{SEARCH_DB}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     overall = Counter()
-    bigrams = Counter()
-    trigrams = Counter()
+    ngrams = Counter()
     per = defaultdict(Counter)
     per_n = Counter()
     n_tokens = 0
@@ -147,8 +181,7 @@ def build_voice_stats(force=False, verbose=False):
             content = [t for t in toks if t not in stop and len(t) >= 2]
             overall.update(content)
             n_tokens += len(content)
-            bigrams.update(phrase_counts(toks, 2))
-            trigrams.update(phrase_counts(toks, 3))
+            ngrams.update(phrase_counts(toks))
             handle = row["handle"] or ""
             if handle:
                 per[handle].update(content)
@@ -162,10 +195,7 @@ def build_voice_stats(force=False, verbose=False):
         return None
 
     words = [{"word": w, "n": n} for w, n in overall.most_common(TOP_WORDS)]
-    phrases = [{"phrase": p, "n": n} for p, n in bigrams.most_common(TOP_PHRASES)]
-    three_word_phrases = [
-        {"phrase": p, "n": n} for p, n in trigrams.most_common(TOP_TRIGRAMS)
-    ]
+    phrases = frequent_phrases(ngrams)
 
     people = []
     for handle, msgs in per_n.most_common():
@@ -191,7 +221,6 @@ def build_voice_stats(force=False, verbose=False):
         "avg_len": round(len_sum / n_msgs) if n_msgs else 0,
         "words": words,
         "phrases": phrases,
-        "three_word_phrases": three_word_phrases,
         "people": people,
     }
     tmp = VOICE_CACHE + ".tmp"
