@@ -1213,6 +1213,33 @@ a.dr-row:hover { background: var(--hover); }
 .dr-ax-c { transform: translateX(-50%); }
 .dr-ax-r { right: 0; }
 
+.eras { padding-bottom: 6px; }
+.er-row { min-height: 38px; gap: 10px; }
+.dr-spark.era { height: 30px; }
+.er-grid { stroke: var(--line); stroke-width: 1; }
+.er-peak { stroke: var(--tone); stroke-width: 1; opacity: 0.5; stroke-dasharray: 2 2; }
+
+.er-when {
+  flex: 0 0 clamp(72px, 20%, 132px);
+  text-align: right;
+  font-size: 11px;
+  color: var(--faint);
+  line-height: 1.25;
+}
+
+.er-when b { display: block; font-size: 12px; font-weight: 700; color: var(--tone); }
+.er-when span { font-variant-numeric: tabular-nums; }
+.eras .dr-axis .dr-plot { height: 14px; }
+
+.er-ax {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--faint);
+}
+
 .dr-table { margin-top: 16px; font-size: 12px; }
 .dr-table summary { cursor: pointer; color: var(--muted); font-weight: 600; }
 .dr-table table { width: 100%; border-collapse: collapse; margin-top: 10px; }

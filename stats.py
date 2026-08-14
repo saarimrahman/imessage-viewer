@@ -104,6 +104,7 @@ PEAK_PEOPLE = 8
 DRIFT_WINDOW_MONTHS = 12
 DRIFT_PEOPLE = 5
 DRIFT_MIN_MSGS = 150
+ERA_MIN_MSGS = 250
 
 
 def monthly_by_person(conn, chat_per=None):
@@ -162,6 +163,15 @@ def people_over_time(people, months, n=PEAK_PEOPLE):
     return series
 
 
+def trim_partial_month(people, months):
+    """Drop the month in progress. Its counts are incomplete, so a share taken
+    from it reads as a false peak."""
+    now = datetime.now()
+    if months and months[-1] == f"{now.year:04d}-{now.month:02d}":
+        return [dict(p, values=p["values"][:-1]) for p in people], months[:-1]
+    return people, months
+
+
 def people_drift(people, months, n=DRIFT_PEOPLE, window=DRIFT_WINDOW_MONTHS):
     """Who gained and who lost your attention, by share of inbound messages.
 
@@ -169,11 +179,7 @@ def people_drift(people, months, n=DRIFT_PEOPLE, window=DRIFT_WINDOW_MONTHS):
     with flat volume is in fact losing ground. Returns (rising, faded, months),
     both lists ordered from the largest gain to the largest loss.
     """
-    now = datetime.now()
-    trim = 1 if months and months[-1] == f"{now.year:04d}-{now.month:02d}" else 0
-    if trim:
-        months = months[:-1]
-        people = [dict(p, values=p["values"][:-1]) for p in people]
+    people, months = trim_partial_month(people, months)
     start = len(months) - 2 * window
     if start < 0:
         return [], [], []
@@ -204,3 +210,62 @@ def people_drift(people, months, n=DRIFT_PEOPLE, window=DRIFT_WINDOW_MONTHS):
     rising = [p for p in ranked if p["drift"] > 0][:n]
     faded = [p for p in ranked if p["drift"] < 0][-n:]
     return rising, faded, months
+
+
+def people_eras(people, months, min_total=ERA_MIN_MSGS):
+    """Every notable person across all history, as a share of what you received
+    each month, ordered by the month they held the largest share.
+
+    Share, not raw count, for the same reason the drift view uses it: total
+    inbound grew about 4x over the span. The order turns the list into a ladder
+    of eras, so the oldest peak is first. Returns (people, months).
+    """
+    people, months = trim_partial_month(people, months)
+    if not months:
+        return [], []
+    totals = [sum(p["values"][i] for p in people) or 1 for i in range(len(months))]
+    out = []
+    for person in people:
+        values = person["values"]
+        total = sum(values)
+        if total < min_total:
+            continue
+        shares = [values[i] / totals[i] for i in range(len(months))]
+        peak_i = max(range(len(months)), key=lambda i: shares[i])
+        out.append(
+            dict(
+                person,
+                values=values,
+                total=total,
+                shares=shares,
+                peak_i=peak_i,
+                peak_ym=months[peak_i],
+                peak_share=shares[peak_i],
+            )
+        )
+    out.sort(key=lambda p: (p["peak_i"], -p["total"]))
+    return out, months
+
+
+def year_owners(people, months):
+    """The person who held the largest share of your inbound in each year."""
+    people, months = trim_partial_month(people, months)
+    out = []
+    for year in sorted({m[:4] for m in months}):
+        idx = [i for i, m in enumerate(months) if m.startswith(year)]
+        year_total = sum(sum(p["values"][i] for i in idx) for p in people)
+        if not year_total:
+            continue
+        best = max(people, key=lambda p: sum(p["values"][i] for i in idx))
+        count = sum(best["values"][i] for i in idx)
+        out.append(
+            {
+                "year": year,
+                "name": best["name"],
+                "handle": best["handle"],
+                "chat_id": best["chat_id"],
+                "count": count,
+                "share": count / year_total,
+            }
+        )
+    return out
