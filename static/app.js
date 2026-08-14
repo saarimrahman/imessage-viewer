@@ -499,9 +499,40 @@
     window.addEventListener("resize", close);
   }
 
+  // Each cell carries all three counts. The buckets are relative to the mode
+  // in view, so a quiet sent-only day still separates from an empty one.
+  function initHeatMode() {
+    const seg = document.getElementById("heatMode");
+    const card = document.querySelector(".heatmap-card");
+    if (!seg || !card) return;
+    const maxes = {};
+    ["a", "r", "s"].forEach((k, i) => {
+      maxes[k] = Number(card.dataset.max.split(",")[i]) || 1;
+    });
+    const cells = card.querySelectorAll(".hcell[data-day]");
+    const nouns = { a: "message", r: "received", s: "sent" };
+
+    function apply(mode) {
+      const top = maxes[mode];
+      cells.forEach((cell) => {
+        const n = Number(cell.dataset[mode]) || 0;
+        let level = 0;
+        if (n > 0) level = n <= top * 0.25 ? 1 : n <= top * 0.5 ? 2 : n <= top * 0.75 ? 3 : 4;
+        cell.className = cell.className.replace(/heat-\d/, "heat-" + level);
+        const noun = nouns[mode];
+        cell.title = cell.dataset.day + ": " + n + " " + noun + (mode === "a" && n !== 1 ? "s" : "");
+      });
+    }
+
+    seg.querySelectorAll('input[name="heatmode"]').forEach((el) => {
+      el.addEventListener("change", () => apply(el.value));
+    });
+  }
+
   initTheme();
   initChatList();
   initDatepicker();
+  initHeatMode();
   initHeatmapFocus();
   initCountup();
   initTileDurations();

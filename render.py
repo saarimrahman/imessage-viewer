@@ -2,6 +2,7 @@
 
 import html
 import json
+import math
 import mimetypes
 import os
 from datetime import datetime, timedelta
@@ -17,6 +18,7 @@ from contacts import (
 )
 from db import (
     REACTION_EXCLUDE_SQL,
+    REACTION_LABELS,
     apple_date,
     chat_filter,
     date_to_apple_ns,
@@ -45,12 +47,18 @@ from stats import (
     FELL_OFF_MIN_GAP_DAYS,
     LONG_TERM_MAX_GAP_DAYS,
     LONG_TERM_MIN_SPAN_DAYS,
+    SESSION_GAP_SECONDS,
     compute_contact_stats,
+    dm_streams,
+    effective_people,
+    initiation,
     monthly_by_person,
     monthly_counts,
     people_drift,
     people_eras,
     people_over_time,
+    reaction_stats,
+    reply_latency,
     year_owners,
 )
 from voice import load_voice
@@ -310,11 +318,25 @@ def render_message_blocks(
     return "".join(blocks)
 
 
+HEAT_MODES = (("a", "All", "Every message"), ("r", "Received", "Messages you received"), ("s", "Sent", "Messages you sent"))
+
+
+def heat_mode_seg_html():
+    btns = "".join(
+        f'<label class="seg-btn" title="{title}">'
+        f'<input type="radio" name="heatmode" value="{key}"{" checked" if key == "a" else ""}> {label}</label>'
+        for key, label, title in HEAT_MODES
+    )
+    return f'<div class="seg seg-sm" id="heatMode" role="radiogroup" aria-label="Heatmap mode">{btns}</div>'
+
+
 def build_heatmap_html(conn, chat_id=None):
+    cols = """date(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as day,
+              count(*) c, sum(m.is_from_me = 0) recv, sum(m.is_from_me = 1) sent"""
     if chat_id is not None:
         chat_sql, chat_params = chat_filter(conn, chat_id)
         counts = conn.execute(
-            f"""SELECT date(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as day, count(*) c
+            f"""SELECT {cols}
                FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
                WHERE {chat_sql} AND {REACTION_EXCLUDE_SQL}
                GROUP BY day""",
@@ -322,18 +344,19 @@ def build_heatmap_html(conn, chat_id=None):
         ).fetchall()
     else:
         counts = conn.execute(
-            """SELECT date(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as day, count(*) c
-               FROM message m WHERE """ + REACTION_EXCLUDE_SQL + """
+            f"""SELECT {cols}
+               FROM message m WHERE {REACTION_EXCLUDE_SQL}
                GROUP BY day"""
         ).fetchall()
     if not counts:
         return ""
 
-    day_counts = {r["day"]: r["c"] for r in counts}
+    day_counts = {r["day"]: (r["c"], r["recv"] or 0, r["sent"] or 0) for r in counts}
     start = datetime.strptime(min(day_counts), "%Y-%m-%d").date()
     end = datetime.strptime(max(day_counts), "%Y-%m-%d").date()
     start_aligned = start - timedelta(days=(start.isoweekday() % 7))
-    max_count = max(day_counts.values())
+    maxes = [max(v[i] for v in day_counts.values()) or 1 for i in range(3)]
+    max_count = maxes[0]
 
     def bucket(c):
         if c == 0:
@@ -383,18 +406,21 @@ def build_heatmap_html(conn, chat_id=None):
             if day_str is None:
                 cell_html_parts.append('<div class="hcell"></div>')
                 continue
-            c = day_counts.get(day_str, 0)
+            c, recv, sent = day_counts.get(day_str, (0, 0, 0))
             level = bucket(c)
             title = f"{day_str}: {c} message{'s' if c != 1 else ''}"
             clickable = c and chat_id is not None
             onclick = f' onclick="location.href=\'/chat/{chat_id}?date={day_str}\'"' if clickable else ""
             cls = "hcell clickable" if clickable else "hcell"
             cell_html_parts.append(
-                f'<div class="{cls} heat-{level}" data-day="{day_str}" title="{title}"{onclick}></div>'
+                f'<div class="{cls} heat-{level}" data-day="{day_str}" title="{title}"'
+                f' data-a="{c}" data-r="{recv}" data-s="{sent}"{onclick}></div>'
             )
 
     legend = "".join(f'<div class="hcell heat-{i}"></div>' for i in range(5))
-    return f"""<div class="heatmap-card"><div class="heatmap">
+    return f"""<div class="heatmap-card" data-max="{','.join(str(m) for m in maxes)}">
+<div class="heatmap-top">{heat_mode_seg_html()}</div>
+<div class="heatmap">
 <div class="heatmap-dow"><span></span><span></span><span>M</span><span></span><span>W</span><span></span><span>F</span><span></span></div>
 <div class="heatmap-wrap"><div class="heatmap-scroll">
 <div class="heatmap-months">{month_html}</div>
@@ -1106,16 +1132,22 @@ def smooth_line(points):
     return " ".join(parts)
 
 
-def render_trend_chart(monthly):
-    if not monthly:
+def fmt_value(v, decimals=0):
+    return f"{v:,.{decimals}f}"
+
+
+def render_trend_chart(months, series, unit="messages", decimals=0, chart_id="trend"):
+    """A line for each series over a shared month axis. One series draws a
+    filled area, two or more draw plain lines with a key above them."""
+    if not months or not series:
         return '<p class="empty">No data.</p>'
     W, H = 900, 240
     pad_l, pad_r, pad_t, pad_b = 48, 12, 16, 28
     plot_w = W - pad_l - pad_r
     plot_h = H - pad_t - pad_b
-    n = len(monthly)
+    n = len(months)
     col_w = plot_w / n
-    max_c = max(c for _, c in monthly) or 1
+    max_c = max(max(s["values"]) for s in series) or 1
 
     def x_at(i):
         return pad_l + col_w * (i + 0.5)
@@ -1123,84 +1155,105 @@ def render_trend_chart(monthly):
     def y_at(c):
         return pad_t + plot_h * (1 - c / max_c)
 
-    points = [(x_at(i), y_at(c)) for i, (_, c) in enumerate(monthly)]
-    line_d = smooth_line(points)
     y0 = pad_t + plot_h
-    area_d = line_d + f" L {points[-1][0]:.1f} {y0:.1f} L {points[0][0]:.1f} {y0:.1f} Z"
+    paths = []
+    dot_groups = []
+    for si, s in enumerate(series):
+        points = [(x_at(i), y_at(c)) for i, c in enumerate(s["values"])]
+        line_d = smooth_line(points)
+        if len(series) == 1:
+            area_d = line_d + f" L {points[-1][0]:.1f} {y0:.1f} L {points[0][0]:.1f} {y0:.1f} Z"
+            paths.append(f'<path d="{area_d}" class="areapath" fill="url(#fill{chart_id})"></path>')
+        paths.append(f'<path d="{line_d}" class="linepath {s["cls"]}"></path>')
+        dot_groups.append(
+            '<g class="ptgroup">'
+            + "".join(f'<circle class="pt {s["cls"]}" cx="{x:.1f}" cy="{y:.1f}" r="0"></circle>' for x, y in points)
+            + "</g>"
+        )
 
-    grid = []
-    for frac in (0.25, 0.5, 0.75):
-        y = y_at(max_c * frac)
-        grid.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{W - pad_r}" y2="{y:.1f}" class="gridline"></line>')
+    grid = [
+        f'<line x1="{pad_l}" y1="{y_at(max_c * frac):.1f}" x2="{W - pad_r}" y2="{y_at(max_c * frac):.1f}" class="gridline"></line>'
+        for frac in (0.25, 0.5, 0.75)
+    ]
 
     hit_cols = []
-    dots = []
     x_labels = []
     seen_years = set()
-    for i, (ym, c) in enumerate(monthly):
-        x, y = points[i]
+    for i, ym in enumerate(months):
         year = ym[:4]
         if (ym[5:7] == "01" or i == 0) and year not in seen_years:
             seen_years.add(year)
-            x_labels.append(f'<text x="{x:.1f}" y="{H - 6}" class="axislabel">{year}</text>')
+            x_labels.append(f'<text x="{x_at(i):.1f}" y="{H - 6}" class="axislabel">{year}</text>')
+        if len(series) == 1:
+            vals = f'{fmt_value(series[0]["values"][i], decimals)} {unit}'
+        else:
+            vals = " · ".join(f'{s["label"]} {fmt_value(s["values"][i], decimals)}' for s in series)
+        top = min(y_at(s["values"][i]) for s in series)
         hit_cols.append(
             f'<rect class="hitcol" x="{pad_l + col_w * i:.1f}" y="{pad_t}" width="{col_w:.1f}" height="{plot_h}" '
-            f'data-label="{ym}" data-count="{c}" data-cx="{x:.1f}" data-cy="{y:.1f}"></rect>'
+            f'data-label="{month_label(ym)}" data-vals="{html.escape(vals, quote=True)}" '
+            f'data-cx="{x_at(i):.1f}" data-cy="{top:.1f}"></rect>'
         )
-        dots.append(f'<circle class="pt" cx="{x:.1f}" cy="{y:.1f}" r="0"></circle>')
 
-    svg = f"""<div class="trendwrap"><svg viewBox="0 0 {W} {H}" class="trendsvg" id="trendsvg" preserveAspectRatio="none">
-<defs><linearGradient id="areaFill" x1="0" y1="0" x2="0" y2="1">
+    key = ""
+    if len(series) > 1:
+        key = '<div class="trendkey">' + "".join(
+            f'<span class="tk {s["cls"]}">{html.escape(s["label"])}</span>' for s in series
+        ) + "</div>"
+
+    svg = f"""{key}<div class="trendwrap"><svg viewBox="0 0 {W} {H}" class="trendsvg" id="svg{chart_id}" preserveAspectRatio="none">
+<defs><linearGradient id="fill{chart_id}" x1="0" y1="0" x2="0" y2="1">
 <stop offset="0%" stop-color="var(--signal)" stop-opacity="0.28"/>
 <stop offset="100%" stop-color="var(--signal)" stop-opacity="0.02"/>
 </linearGradient></defs>
 {''.join(grid)}
 <line x1="{pad_l}" y1="{y0:.1f}" x2="{W - pad_r}" y2="{y0:.1f}" class="axisline"></line>
-<text x="4" y="{pad_t + 4}" class="axislabel">{max_c:,}</text>
-<path d="{area_d}" class="areapath"></path>
-<path d="{line_d}" class="linepath"></path>
-{''.join(dots)}
+<text x="4" y="{pad_t + 4}" class="axislabel">{fmt_value(max_c, decimals)}</text>
+{''.join(paths)}
+{''.join(dot_groups)}
 {''.join(x_labels)}
 {''.join(hit_cols)}
-</svg><div class="trendtip" id="trendtip"></div></div>"""
+</svg><div class="trendtip" id="tip{chart_id}"></div></div>"""
 
     script = """
 (function() {
-  const svg = document.getElementById('trendsvg');
+  const svg = document.getElementById('svg__ID__');
   if (!svg) return;
-  const line = svg.querySelector('.linepath');
-  const len = line.getTotalLength();
-  line.style.strokeDasharray = len;
-  line.style.strokeDashoffset = len;
-  requestAnimationFrame(() => {
-    line.style.transition = 'stroke-dashoffset 1.2s ease';
-    line.style.strokeDashoffset = 0;
+  svg.querySelectorAll('.linepath').forEach((line, i) => {
+    const len = line.getTotalLength();
+    line.style.strokeDasharray = len;
+    line.style.strokeDashoffset = len;
+    requestAnimationFrame(() => {
+      line.style.transition = 'stroke-dashoffset 1.2s ease ' + (i * 0.15) + 's';
+      line.style.strokeDashoffset = 0;
+    });
   });
   const area = svg.querySelector('.areapath');
-  area.style.opacity = 0;
-  requestAnimationFrame(() => {
-    area.style.transition = 'opacity 1s ease 0.3s';
-    area.style.opacity = 1;
-  });
-  const tip = document.getElementById('trendtip');
-  const dots = svg.querySelectorAll('.pt');
+  if (area) {
+    area.style.opacity = 0;
+    requestAnimationFrame(() => {
+      area.style.transition = 'opacity 1s ease 0.3s';
+      area.style.opacity = 1;
+    });
+  }
+  const tip = document.getElementById('tip__ID__');
+  const groups = svg.querySelectorAll('.ptgroup');
   svg.querySelectorAll('.hitcol').forEach((col, i) => {
     col.addEventListener('mouseenter', () => {
-      dots[i].setAttribute('r', 4.5);
+      groups.forEach(g => g.children[i].setAttribute('r', 4.5));
       const box = svg.getBoundingClientRect();
-      const scaleX = box.width / __W__, scaleY = box.height / __H__;
-      tip.style.left = (parseFloat(col.dataset.cx) * scaleX) + 'px';
-      tip.style.top = (parseFloat(col.dataset.cy) * scaleY) + 'px';
-      tip.textContent = col.dataset.label + ': ' + parseInt(col.dataset.count, 10).toLocaleString() + ' messages';
+      tip.style.left = (parseFloat(col.dataset.cx) * box.width / __W__) + 'px';
+      tip.style.top = (parseFloat(col.dataset.cy) * box.height / __H__) + 'px';
+      tip.textContent = col.dataset.label + ' · ' + col.dataset.vals;
       tip.style.opacity = 1;
     });
     col.addEventListener('mouseleave', () => {
-      dots[i].setAttribute('r', 0);
+      groups.forEach(g => g.children[i].setAttribute('r', 0));
       tip.style.opacity = 0;
     });
   });
 })();
-""".replace("__W__", str(W)).replace("__H__", str(H))
+""".replace("__W__", str(W)).replace("__H__", str(H)).replace("__ID__", chart_id)
 
     return svg + f"<script>{script}</script>"
 
@@ -1306,7 +1359,8 @@ def spark_tip_script(wrap_id, tip_id, view_w):
       const svg = col.ownerSVGElement, box = svg.getBoundingClientRect();
       const wbox = wrap.getBoundingClientRect();
       const sub = col.dataset.sub ? ' · ' + col.dataset.sub : '';
-      tip.textContent = col.dataset.label + ' · ' + (+col.dataset.c).toLocaleString() + ' messages' + sub;
+      tip.textContent = col.dataset.text
+        || (col.dataset.label + ' · ' + (+col.dataset.c).toLocaleString() + ' messages' + sub);
       tip.style.left = (box.left - wbox.left + col.dataset.cx * box.width / {view_w}) + 'px';
       tip.style.top = (box.top - wbox.top) + 'px';
       tip.style.opacity = 1;
@@ -1392,6 +1446,178 @@ def render_people_eras(eras, months):
 {spark_tip_script("eraswrap", "erastip", ERA_W)}"""
 
 
+LAT_W, LAT_H = 240, 34
+
+
+def format_gap(seconds):
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+LAT_MAX_GAP_MONTHS = 2
+
+
+def latency_spark(row, months):
+    """Two lines over the shared month axis: how fast you answer them, and how
+    fast they answer you.
+
+    The scale inside a row is logarithmic. Reply times run from seconds to
+    hours, so one slow month flattens everything else on a linear scale. A
+    month without enough replies to trust is skipped, and a run of skipped
+    months breaks the line rather than drawing across the hole.
+    """
+    n = len(months)
+    step = LAT_W / (n - 1) if n > 1 else LAT_W
+    values = [v for _, v in row["my_points"] + row["their_points"]] or [1]
+    lo, hi = max(min(values), 1), max(values)
+    span = math.log10(hi / lo) or 1
+
+    def y_at(v):
+        return LAT_H - 1.5 - (math.log10(max(v, lo) / lo) / span) * (LAT_H - 3)
+
+    def path(points):
+        segments = []
+        run = []
+        for i, v in points:
+            if run and i - run[-1][0] > LAT_MAX_GAP_MONTHS:
+                segments.append(run)
+                run = []
+            run.append((i, v))
+        if run:
+            segments.append(run)
+        out = []
+        for segment in segments:
+            steps = [f"{'M' if k == 0 else 'L'} {i * step:.1f} {y_at(v):.1f}" for k, (i, v) in enumerate(segment)]
+            if len(segment) == 1:
+                # A round cap turns a zero-length line into a dot, so a lone
+                # month still shows instead of vanishing.
+                steps.append(steps[0].replace("M", "L"))
+            out.append(" ".join(steps))
+        return " ".join(out)
+
+    mine = dict(row["my_points"])
+    theirs = dict(row["their_points"])
+    hits = []
+    for i in sorted(set(mine) | set(theirs)):
+        parts = [month_label(months[i])]
+        if i in mine:
+            parts.append(f"you {format_gap(mine[i])}")
+        if i in theirs:
+            parts.append(f"them {format_gap(theirs[i])}")
+        hits.append(
+            f'<rect class="hitcol" x="{i * step - step / 2:.1f}" y="0" width="{step:.1f}" height="{LAT_H}" '
+            f'data-text="{html.escape(" · ".join(parts), quote=True)}" data-cx="{i * step:.1f}"></rect>'
+        )
+    return (
+        f'<svg class="dr-spark lat" viewBox="0 0 {LAT_W} {LAT_H}" preserveAspectRatio="none" '
+        f'role="img" aria-label="{html.escape(row["name"])} median reply time by month">'
+        f'<path class="dr-line lat-them" d="{path(row["their_points"])}" vector-effect="non-scaling-stroke"></path>'
+        f'<path class="dr-line lat-me" d="{path(row["my_points"])}" vector-effect="non-scaling-stroke"></path>'
+        f'{"".join(hits)}</svg>'
+    )
+
+
+def render_reply_latency(rows, months):
+    if not rows:
+        return '<p class="empty">Not enough back-and-forth yet to time a reply.</p>'
+    out = []
+    for row in rows:
+        inner = (
+            f'<span class="dr-name">{html.escape(row["name"])}</span>'
+            f'<span class="dr-plot">{latency_spark(row, months)}</span>'
+            f'<span class="lat-nums"><b class="lat-me">{format_gap(row["my_median"])}</b>'
+            f'<b class="lat-them">{format_gap(row["their_median"])}</b></span>'
+        )
+        tag = "a" if row["chat_id"] else "div"
+        href = f' href="/chat/{row["chat_id"]}"' if row["chat_id"] else ""
+        out.append(f'<{tag} class="dr-row lat-row"{href}>{inner}</{tag}>')
+    labels = "".join(
+        f'<span class="er-ax" style="left:{i * 100 / (len(months) - 1):.2f}%">{ym[:4]}</span>'
+        for i, ym in enumerate(months)
+        if ym.endswith("-01") and i
+    )
+    return f"""<div class="trendkey"><span class="tk lat-me">You answer them</span><span class="tk lat-them">They answer you</span></div>
+<div class="trendwrap drift" id="latwrap">
+<div class="dr-row lat-row lat-head"><span class="dr-name"></span><span class="dr-plot"></span>
+<span class="lat-nums"><b>you</b><b>them</b></span></div>
+{"".join(out)}
+<div class="dr-row dr-axis"><span class="dr-name"></span>
+<span class="dr-plot"><span class="dr-ax-l">{short_month(months[0])}</span>{labels}
+<span class="dr-ax-r">{short_month(months[-1])}</span></span><span class="lat-nums"></span></div>
+<div class="trendtip dr-tip" id="lattip"></div>
+</div>
+{spark_tip_script("latwrap", "lattip", LAT_W)}"""
+
+
+def render_initiation(people, years):
+    if not people:
+        return '<p class="empty">Not enough separate conversations yet to see who opens them.</p>'
+    head = "".join(f'<span class="in-cell in-head">{y}</span>' for y in years)
+    rows = []
+    for person in people:
+        cells = []
+        for year in years:
+            slot = person["years"].get(year)
+            if not slot:
+                cells.append('<span class="in-cell in-empty"></span>')
+                continue
+            mine, total = slot
+            share = mine / total
+            tone = f"color-mix(in oklab, var(--rise) {share * 100:.0f}%, var(--fade))"
+            title = f"{year}: you opened {mine} of {total} conversations"
+            cells.append(
+                f'<span class="in-cell" title="{html.escape(title, quote=True)}" '
+                f'style="background: color-mix(in oklab, {tone} 42%, var(--surface))">'
+                f'{share * 100:.0f}%</span>'
+            )
+        inner = (
+            f'<span class="dr-name">{html.escape(person["name"])}</span>'
+            f'<span class="in-strip">{"".join(cells)}</span>'
+            f'<span class="in-total">{person["share"] * 100:.0f}%'
+            f'<span class="dr-unit">of {person["total"]}</span></span>'
+        )
+        tag = "a" if person["chat_id"] else "div"
+        href = f' href="/chat/{person["chat_id"]}"' if person["chat_id"] else ""
+        rows.append(f'<{tag} class="dr-row in-row"{href}>{inner}</{tag}>')
+    return f"""<div class="trendkey"><span class="tk lat-them">They open</span><span class="tk lat-me">You open</span></div>
+<div class="trendwrap drift">
+<div class="dr-row in-row in-head-row"><span class="dr-name"></span>
+<span class="in-strip">{head}</span><span class="in-total">All time</span></div>
+{"".join(rows)}
+</div>"""
+
+
+def reaction_emoji(token):
+    if isinstance(token, str):
+        return token
+    kind = REACTION_LABELS.get(token)
+    return kind[0] if kind else "•"
+
+
+def render_reactions(rows):
+    if not rows:
+        return '<p class="empty">No tapbacks on your one-to-one threads yet.</p>'
+    out = []
+    for row in rows:
+        chips = "".join(
+            f'<span class="rx-chip"><span class="rx-e">{reaction_emoji(token)}</span>{n:,}</span>'
+            for token, n in row["got"].most_common(4)
+        )
+        inner = (
+            f'<span class="dr-name">{html.escape(row["name"])}</span>'
+            f'<span class="rx-chips">{chips}</span>'
+            f'<span class="rx-rate">{row["rate"] * 100:.0f}%'
+            f'<span class="dr-unit">of {row["my_msgs"]:,}</span></span>'
+        )
+        tag = "a" if row["chat_id"] else "div"
+        href = f' href="/chat/{row["chat_id"]}"' if row["chat_id"] else ""
+        out.append(f'<{tag} class="dr-row rx-row"{href}>{inner}</{tag}>')
+    return f'<div class="trendwrap drift">{"".join(out)}</div>'
+
+
 def render_word_cloud(words):
     if not words:
         return ""
@@ -1440,6 +1666,27 @@ def render_voice_section(chat_by_handle):
             f'<span class="n">{p["msgs"]:,} texts you sent</span></div>'
             f'<div class="vchips">{chips}</div></div>'
         )
+    years_html = "".join(
+        f'<div class="voice-person"><div class="voice-person-h"><span>{y["year"]}</span>'
+        f'<span class="n">{y["msgs"]:,} texts you sent</span></div>'
+        f'<div class="vchips">'
+        + "".join(
+            f'<a class="vchip" href="/search?q={html.escape(quote(w["word"]), quote=True)}">'
+            f'{html.escape(w["word"])}<span class="lift">{w["lift"]}×</span>'
+            f'<span class="n">{w["n"]:,}</span></a>'
+            for w in y.get("words") or []
+        )
+        + "</div></div>"
+        for y in voice.get("years") or []
+        if y.get("words")
+    )
+    years_block = (
+        '<h2 class="section-h">Words that belong to a year</h2>'
+        '<p class="section-sub">You said these more that year than you do across all your texts. '
+        "Lift is how many times more. The list reads as what you were doing.</p>" + years_html
+        if years_html
+        else ""
+    )
     people_block = (
         "<h2 class=\"section-h\">Words that belong to a person</h2>"
         "<p class=\"section-sub\">You say these more with them than you do overall. "
@@ -1454,6 +1701,7 @@ def render_voice_section(chat_by_handle):
 <h2 class="section-h">Phrases you reach for</h2>
 <p class="section-sub">Two or more words, when you say them a lot.</p>
 <div class="vchips">{phrase_html}</div>
+{years_block}
 {people_block}"""
 
 
@@ -1475,6 +1723,12 @@ def render_stats():
     eras, era_months = people_eras(people, all_months)
     owners = year_owners(people, all_months)
     heatmap_html = build_heatmap_html(conn)
+    chat_per = {c["handle"]: c["chat_id"] for c in contacts}
+    streams = dm_streams(conn, chat_per=chat_per)
+    latency = reply_latency(streams, all_months)
+    openers, opener_years = initiation(streams)
+    reactions = reaction_stats(conn, streams)
+    effective = effective_people(people, all_months)
     conn.close()
 
     contacts.sort(key=lambda x: -x["count"])
@@ -1538,6 +1792,31 @@ def render_stats():
 <h2 class="section-h">Activity, every day</h2>
 {heatmap_html}
 
+<h2 class="section-h">How fast you answer</h2>
+<p class="section-sub">Median time to reply, for your {len(latency)} busiest one-to-one threads, month by month.
+The clock starts on the first message nobody has answered yet. A turn that takes more than a day is a new
+conversation, not a reply, so it does not count. Each row has its own log scale, so up is slower.</p>
+{render_reply_latency(latency, all_months)}
+
+<h2 class="section-h">Who reaches first</h2>
+<p class="section-sub">Share of conversations that you opened, year by year. A new conversation starts after
+{SESSION_GAP_SECONDS // 3600} hours of silence. Near 50% is a thread you both open. Near 0 or 100 is one person carrying it.</p>
+{render_initiation(openers, opener_years)}
+
+<h2 class="section-h">How wide your attention is</h2>
+<p class="section-sub">The effective number of people you texted each month. One person holding everything reads as 1.
+Ten people at an even tenth reads as 10. It moves on its own: your total volume can climb while the circle narrows.</p>
+{render_trend_chart(
+    [ym for ym, _ in effective],
+    [{"label": "People", "cls": "s-solo", "values": [v for _, v in effective]}],
+    unit="people", decimals=1, chart_id="eff",
+)}
+
+<h2 class="section-h">Who reacts to you</h2>
+<p class="section-sub">Tapbacks on the messages you sent, as a share of everything you sent them.
+One-to-one threads only, so the reactor is never in doubt.</p>
+{render_reactions(reactions)}
+
 {render_voice_section({c["handle"]: c["chat_id"] for c in contacts})}
 
 <h2 class="section-h">People fading in and out</h2>
@@ -1559,7 +1838,13 @@ Sorted by the month they held the largest share, so the list reads top to bottom
 {peak_html}
 
 <h2 class="section-h">Messages per month</h2>
-{render_trend_chart(monthly)}
+{render_trend_chart(
+    [ym for ym, _, _ in monthly],
+    [
+        {"label": "Received", "cls": "s-recv", "values": [r for _, r, _ in monthly]},
+        {"label": "Sent", "cls": "s-sent", "values": [s for _, _, s in monthly]},
+    ],
+)}
 
 <h2 class="section-h">Most contacted</h2>
 <div class="panel">{render_leaderboard(most_contacted, max_count)}</div>

@@ -29,6 +29,12 @@ SMS_STOP = frozenset(
     "gonna wanna gotta ur would could also us".split()
 )
 MIN_PERSON_MSGS = 80
+MIN_YEAR_MSGS = 200
+# A year is a large slice of the whole corpus, so a word cannot stand out by as
+# much as it can inside one person's thread. The bar is lower for both.
+YEAR_MIN_WORD_COUNT = 5
+YEAR_MIN_LIFT = 1.5
+DISTINCTIVE_PER_YEAR = 14
 TOP_WORDS = 80
 TOP_PHRASES = 20
 MAX_PHRASE_N = 6
@@ -171,20 +177,21 @@ def _cache_is_current(last_msg_id):
     return bool(data) and data.get("last_msg_id") == last_msg_id
 
 
-def _distinctive(person_counts, person_total, overall, n_tokens, skip):
+def _distinctive(person_counts, person_total, overall, n_tokens, skip,
+                 min_n=6, min_lift=2.0, limit=DISTINCTIVE_PER_PERSON):
     scored = []
     for w, n in person_counts.items():
-        if n < 6 or w in skip:
+        if n < min_n or w in skip:
             continue
         g = overall[w]
         if not g:
             continue
         lift = (n / person_total) / (g / n_tokens)
-        if lift < 2.0:
+        if lift < min_lift:
             continue
         scored.append((n * math.log(lift), lift, n, w))
     scored.sort(reverse=True)
-    return [{"word": w, "n": n, "lift": round(lift, 1)} for _, lift, n, w in scored[:DISTINCTIVE_PER_PERSON]]
+    return [{"word": w, "n": n, "lift": round(lift, 1)} for _, lift, n, w in scored[:limit]]
 
 
 def build_voice_stats(force=False, verbose=False):
@@ -207,12 +214,15 @@ def build_voice_stats(force=False, verbose=False):
     ngrams = Counter()
     per = defaultdict(Counter)
     per_n = Counter()
+    by_year = defaultdict(Counter)
+    year_n = Counter()
     n_tokens = 0
     n_msgs = 0
     len_sum = 0
     try:
         for row in conn.execute(
-            "SELECT handle, body FROM docs WHERE is_from_me=1"
+            "SELECT handle, body, strftime('%Y', datetime(date/1000000000+978307200,"
+            "'unixepoch','localtime')) as year FROM docs WHERE is_from_me=1"
         ):
             body = row["body"] or ""
             toks = _tokenize(body)
@@ -226,6 +236,9 @@ def build_voice_stats(force=False, verbose=False):
             if handle:
                 per[handle].update(content)
                 per_n[handle] += 1
+            if row["year"]:
+                by_year[row["year"]].update(content)
+                year_n[row["year"]] += 1
     finally:
         conn.close()
 
@@ -254,6 +267,23 @@ def build_voice_stats(force=False, verbose=False):
         if len(people) >= TOP_PEOPLE:
             break
 
+    years = []
+    for year in sorted(year_n):
+        if year_n[year] < MIN_YEAR_MSGS:
+            continue
+        total = sum(by_year[year].values()) or 1
+        years.append(
+            {
+                "year": year,
+                "msgs": year_n[year],
+                "words": _distinctive(
+                    by_year[year], total, overall, n_tokens, set(),
+                    min_n=YEAR_MIN_WORD_COUNT, min_lift=YEAR_MIN_LIFT,
+                    limit=DISTINCTIVE_PER_YEAR,
+                ),
+            }
+        )
+
     data = {
         "schema": VOICE_SCHEMA,
         "last_msg_id": last_msg_id,
@@ -262,6 +292,7 @@ def build_voice_stats(force=False, verbose=False):
         "words": words,
         "phrases": phrases,
         "people": people,
+        "years": years,
     }
     tmp = VOICE_CACHE + ".tmp"
     with open(tmp, "w") as f:

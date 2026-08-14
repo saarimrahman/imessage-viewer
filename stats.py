@@ -2,6 +2,7 @@
 
 from collections import Counter, defaultdict
 from datetime import datetime
+from statistics import median
 
 from config import APPLE_EPOCH
 from contacts import resolve_contact
@@ -79,12 +80,14 @@ def compute_contact_stats(conn):
 
 
 def monthly_counts(conn):
+    """(month, received, sent) for every month with traffic."""
     rows = conn.execute(
-        f"""SELECT strftime('%Y-%m', datetime(m.date/1000000000+978307200,'unixepoch','localtime')) as ym, count(*) c
+        f"""SELECT strftime('%Y-%m', datetime(m.date/1000000000+978307200,'unixepoch','localtime')) as ym,
+                   sum(m.is_from_me = 0) as recv, sum(m.is_from_me = 1) as sent
             FROM message m WHERE {REACTION_EXCLUDE_SQL}
             GROUP BY ym ORDER BY ym"""
     ).fetchall()
-    return [(r["ym"], r["c"]) for r in rows]
+    return [(r["ym"], r["recv"] or 0, r["sent"] or 0) for r in rows if r["ym"]]
 
 
 def month_range(start_ym, end_ym):
@@ -245,6 +248,272 @@ def people_eras(people, months, min_total=ERA_MIN_MSGS):
         )
     out.sort(key=lambda p: (p["peak_i"], -p["total"]))
     return out, months
+
+
+SESSION_GAP_SECONDS = 4 * 3600
+REPLY_MAX_SECONDS = 24 * 3600
+LATENCY_MIN_REPLIES = 40
+LATENCY_MIN_MONTH_REPLIES = 5
+LATENCY_PEOPLE = 10
+INITIATION_MIN_SESSIONS = 25
+INITIATION_PEOPLE = 14
+REACTION_MIN_MSGS = 150
+REACTION_PEOPLE = 12
+
+
+def dm_streams(conn, chat_per=None):
+    """Every one-to-one thread as one time-ordered list of (unix seconds,
+    is_from_me).
+
+    Group chats are left out on purpose. With three people in the room a reply
+    gap and an opener have no single owner. A person who moved between SMS and
+    iMessage owns two chat rows, so the events are keyed by resolved name and
+    stay in date order across both.
+    """
+    participants = defaultdict(list)
+    for r in conn.execute(
+        """SELECT chj.chat_id as chat_id, h.id as handle
+           FROM chat_handle_join chj JOIN handle h ON h.ROWID = chj.handle_id"""
+    ):
+        participants[r["chat_id"]].append(r["handle"])
+    dm_handle = {c: hs[0] for c, hs in participants.items() if len(hs) == 1}
+
+    streams = {}
+    handle_totals = defaultdict(Counter)
+    for r in conn.execute(
+        f"""SELECT cmj.chat_id as chat_id, m.date as d, m.is_from_me as me
+            FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            WHERE {REACTION_EXCLUDE_SQL} ORDER BY m.date"""
+    ):
+        handle = dm_handle.get(r["chat_id"])
+        if handle is None:
+            continue
+        name = resolve_contact(handle) or handle
+        handle_totals[name][handle] += 1
+        stream = streams.get(name)
+        if stream is None:
+            stream = streams[name] = {"name": name, "events": []}
+        stream["events"].append((r["d"] / 1_000_000_000 + APPLE_EPOCH, r["me"]))
+
+    chat_per = chat_per or best_chat_per_handle(conn)
+    for name, stream in streams.items():
+        handle = handle_totals[name].most_common(1)[0][0]
+        stream["handle"] = handle
+        stream["chat_id"] = chat_per.get(handle)
+        stream["sent"] = sum(me for _, me in stream["events"])
+        stream["received"] = len(stream["events"]) - stream["sent"]
+    return streams
+
+
+def sessions(events, gap=SESSION_GAP_SECONDS):
+    """(start seconds, opener is_from_me) for each burst of talk. A silence
+    longer than the gap closes one session and opens the next."""
+    out = []
+    prev = None
+    for ts, me in events:
+        if prev is None or ts - prev > gap:
+            out.append((ts, me))
+        prev = ts
+    return out
+
+
+def reply_gaps(events, cap=REPLY_MAX_SECONDS):
+    """(seconds, replier is_from_me) for each change of turn.
+
+    The clock starts on the first unanswered message of a run, not the last, so
+    a burst of five texts counts the wait the sender really had. A turn that
+    changes after more than the cap is a new conversation and not an answer, so
+    it is dropped.
+    """
+    out = []
+    pending_ts = pending_me = None
+    for ts, me in events:
+        if pending_me is None:
+            pending_ts, pending_me = ts, me
+        elif me != pending_me:
+            if ts - pending_ts <= cap:
+                out.append((ts, ts - pending_ts, me))
+            pending_ts, pending_me = ts, me
+    return out
+
+
+def monthly_medians(gaps, month_index):
+    """(month index, median seconds) for each month with enough replies to
+    trust. A month below the bar is left out, so the line skips it."""
+    by_month = defaultdict(list)
+    for ts, secs, _ in gaps:
+        by_month[datetime.fromtimestamp(ts).strftime("%Y-%m")].append(secs)
+    points = [
+        (month_index[ym], median(vals))
+        for ym, vals in by_month.items()
+        if len(vals) >= LATENCY_MIN_MONTH_REPLIES and ym in month_index
+    ]
+    points.sort()
+    return points
+
+
+def reply_latency(streams, months, n=LATENCY_PEOPLE):
+    """How long each side takes to answer the other, month by month.
+
+    Volume says how much you talk. This says how fast you turn around, which
+    moves on its own: a thread can hold its message count while the median
+    answer slides from minutes to hours.
+    """
+    month_index = {ym: i for i, ym in enumerate(months)}
+    out = []
+    for stream in streams.values():
+        gaps = reply_gaps(stream["events"])
+        mine = [g for g in gaps if g[2]]
+        theirs = [g for g in gaps if not g[2]]
+        if min(len(mine), len(theirs)) < LATENCY_MIN_REPLIES:
+            continue
+        out.append(
+            {
+                "name": stream["name"],
+                "handle": stream["handle"],
+                "chat_id": stream["chat_id"],
+                "total": len(stream["events"]),
+                "my_median": median(g[1] for g in mine),
+                "their_median": median(g[1] for g in theirs),
+                "my_replies": len(mine),
+                "their_replies": len(theirs),
+                "my_points": monthly_medians(mine, month_index),
+                "their_points": monthly_medians(theirs, month_index),
+            }
+        )
+    out.sort(key=lambda p: -p["total"])
+    out = out[:n]
+    out.sort(key=lambda p: p["my_median"])
+    return out
+
+
+def initiation(streams, n=INITIATION_PEOPLE):
+    """Who speaks first, year by year.
+
+    A share near 50% is a thread both people open. A share walking toward 0 or
+    100 is one person carrying it. Returns (people, years).
+    """
+    out = []
+    years_seen = set()
+    for stream in streams.values():
+        opens = sessions(stream["events"])
+        if len(opens) < INITIATION_MIN_SESSIONS:
+            continue
+        by_year = defaultdict(lambda: [0, 0])
+        for ts, me in opens:
+            slot = by_year[datetime.fromtimestamp(ts).strftime("%Y")]
+            slot[0] += me
+            slot[1] += 1
+        years_seen.update(by_year)
+        mine = sum(me for _, me in opens)
+        out.append(
+            {
+                "name": stream["name"],
+                "handle": stream["handle"],
+                "chat_id": stream["chat_id"],
+                "years": {y: tuple(v) for y, v in by_year.items()},
+                "mine": mine,
+                "total": len(opens),
+                "share": mine / len(opens),
+            }
+        )
+    out.sort(key=lambda p: -p["total"])
+    out = out[:n]
+    out.sort(key=lambda p: -p["share"])
+    return out, sorted(years_seen)
+
+
+def effective_people(people, months):
+    """(month, effective number of people) using the inverse Simpson index.
+
+    One person holding everything gives 1. Ten people at an even tenth give 10.
+    It reads as the width of your attention, which no count on this page shows:
+    volume can climb while the circle narrows.
+    """
+    people, months = trim_partial_month(people, months)
+    out = []
+    for i, ym in enumerate(months):
+        total = sum(p["values"][i] for p in people)
+        if not total:
+            continue
+        concentration = sum((p["values"][i] / total) ** 2 for p in people)
+        out.append((ym, 1 / concentration))
+    return out
+
+
+def reaction_stats(conn, streams, min_msgs=REACTION_MIN_MSGS, n=REACTION_PEOPLE):
+    """Tapbacks traded in one-to-one threads.
+
+    A later 3xxx row for the same (target, reactor) pair means the tapback was
+    taken back, so the rows are replayed in date order rather than counted.
+    Only one-to-one threads count, so the reactor is never ambiguous.
+    """
+    participants = defaultdict(list)
+    for r in conn.execute(
+        """SELECT chj.chat_id as chat_id, h.id as handle
+           FROM chat_handle_join chj JOIN handle h ON h.ROWID = chj.handle_id"""
+    ):
+        participants[r["chat_id"]].append(r["handle"])
+    dm_handle = {c: hs[0] for c, hs in participants.items() if len(hs) == 1}
+
+    state = {}
+    for r in conn.execute(
+        """SELECT r.associated_message_guid as g, r.associated_message_type as t,
+                  r.associated_message_emoji as emoji, r.is_from_me as reactor_me,
+                  tgt.is_from_me as target_me, cmj.chat_id as chat_id
+           FROM message r
+           JOIN message tgt
+             ON tgt.guid = substr(r.associated_message_guid,
+                                  instr(r.associated_message_guid, '/') + 1)
+           JOIN chat_message_join cmj ON cmj.message_id = tgt.ROWID
+           WHERE r.associated_message_type BETWEEN 2000 AND 3999
+           ORDER BY r.date"""
+    ):
+        handle = dm_handle.get(r["chat_id"])
+        if handle is None:
+            continue
+        key = (r["g"], r["reactor_me"], r["chat_id"])
+        if r["t"] >= 3000:
+            state.pop(key, None)
+        else:
+            state[key] = (handle, r["t"], r["emoji"], r["reactor_me"], r["target_me"])
+
+    got = defaultdict(Counter)
+    gave = defaultdict(Counter)
+    for handle, kind, emoji, reactor_me, target_me in state.values():
+        name = resolve_contact(handle) or handle
+        token = emoji if kind == 2006 and emoji else kind
+        if reactor_me and not target_me:
+            gave[name][token] += 1
+        elif not reactor_me and target_me:
+            got[name][token] += 1
+
+    out = []
+    for name, stream in streams.items():
+        if stream["sent"] < min_msgs:
+            continue
+        mine, theirs = got[name], gave[name]
+        if not sum(mine.values()):
+            continue
+        out.append(
+            {
+                "name": name,
+                "handle": stream["handle"],
+                "chat_id": stream["chat_id"],
+                "got": mine,
+                "gave": theirs,
+                "count": sum(mine.values()),
+                "rate": sum(mine.values()) / stream["sent"],
+                "laughs": mine.get(2003, 0),
+                "laugh_rate": mine.get(2003, 0) / stream["sent"],
+                "my_msgs": stream["sent"],
+                "their_msgs": stream["received"],
+                "gave_count": sum(theirs.values()),
+                "gave_rate": sum(theirs.values()) / (stream["received"] or 1),
+            }
+        )
+    out.sort(key=lambda p: -p["rate"])
+    return out[:n]
 
 
 def year_owners(people, months):

@@ -1288,7 +1288,7 @@ html[data-mediasize="s"] .tile-dur { display: none; }
 .axisline { stroke: var(--line); stroke-width: 1; }
 .gridline { stroke: var(--line); stroke-width: 1; }
 .axislabel { font-size: 10px; font-weight: 600; fill: var(--faint); }
-.areapath { fill: url(#areaFill); stroke: none; }
+.areapath { stroke: none; }
 .linepath { fill: none; stroke: var(--signal); stroke-width: 2.25; stroke-linejoin: round; stroke-linecap: round; }
 .pt { fill: var(--signal); stroke: var(--surface); stroke-width: 2; }
 .hitcol { fill: transparent; cursor: crosshair; }
@@ -1415,6 +1415,117 @@ a.dr-row:hover { background: var(--hover); }
   font-weight: 600;
   color: var(--faint);
 }
+
+/* Blue is you, warm is them. Same pair as the drift chart, so the reader
+   learns the two colors once and they hold across every chart on the page. */
+.linepath.s-sent, .lat-me { stroke: var(--rise); }
+.linepath.s-recv, .lat-them { stroke: var(--fade); }
+.linepath.s-solo { stroke: var(--signal); }
+.pt.s-sent { fill: var(--rise); }
+.pt.s-recv { fill: var(--fade); }
+.pt.s-solo { fill: var(--signal); }
+
+.trendkey { display: flex; gap: 14px; margin: 0 0 8px 2px; }
+
+.tk {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.tk::before { content: ""; width: 14px; height: 2.5px; border-radius: 2px; background: currentColor; }
+.tk.s-sent::before, .tk.lat-me::before { background: var(--rise); }
+.tk.s-recv::before, .tk.lat-them::before { background: var(--fade); }
+
+/* ——— Reply latency ——— */
+
+.dr-spark.lat { height: 34px; }
+.dr-spark.lat .dr-line { stroke-width: 2; }
+.lat-row { min-height: 38px; gap: 10px; }
+
+.lat-nums {
+  display: flex;
+  gap: 10px;
+  flex: 0 0 96px;
+  justify-content: flex-end;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.lat-nums b { min-width: 40px; text-align: right; }
+.lat-nums b.lat-me { color: var(--rise); }
+.lat-nums b.lat-them { color: var(--fade); }
+.lat-head { min-height: 20px; }
+.lat-head .lat-nums b { font-size: 10px; font-weight: 600; color: var(--faint); text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* ——— Who reaches first ——— */
+
+.in-row { min-height: 38px; gap: 10px; }
+.in-strip { display: flex; flex: 1 1 auto; gap: 4px; min-width: 0; }
+
+.in-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 6px;
+  padding: 6px 0;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+}
+
+.in-empty { background: var(--surface-2); }
+.in-head { background: none; color: var(--faint); font-size: 10px; font-weight: 600; padding: 0; }
+.in-head-row { min-height: 20px; }
+
+.in-total {
+  flex: 0 0 96px;
+  text-align: right;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.in-head-row .in-total { font-size: 10px; font-weight: 600; color: var(--faint); text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* ——— Tapbacks ——— */
+
+.rx-row { min-height: 42px; gap: 10px; }
+.rx-chips { display: flex; flex: 1 1 auto; flex-wrap: wrap; gap: 6px; min-width: 0; }
+
+.rx-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: 3px 9px 3px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.rx-e { font-size: 13px; line-height: 1; }
+
+.rx-rate {
+  flex: 0 0 96px;
+  text-align: right;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.heatmap-top { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+
+.voice-person-h > span:first-child { font-weight: 700; font-size: 14px; color: var(--ink); font-variant-numeric: tabular-nums; }
 
 .dr-table { margin-top: 16px; font-size: 12px; }
 .dr-table summary { cursor: pointer; color: var(--muted); font-weight: 600; }
