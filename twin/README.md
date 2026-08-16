@@ -6,11 +6,15 @@ Your messages and adapters stay on this Mac. The app stores the generated datase
 
 ## Data coverage
 
-The Complete run uses every non-empty text from the chosen person. By default that person is you. You can train as any contact. Each person keeps a separate adapter.
+Complete trains on direct 1:1 chats only. Group chats are counted on the Audit tab and left out of the adapter, because several senders would otherwise share one anonymous `user` role.
 
-The exporter groups nearby consecutive bubbles into one turn. A gap of more than 30 minutes starts a new turn.
+The exporter splits each chat into sessions at a 12-hour gap. Consecutive bubbles from the same person stay together with a `<|bubble|>` delimiter. A 30-minute gap starts a new bubble group. Training windows do not cross sessions.
 
-Each target has up to six real conversation turns for context. The exporter also adds shorter versions of long conversation pairs.
+Each authentic reply with incoming context becomes one example. Conversation starters with no incoming message in that session are not mixed into reply training. Later sessions are held out 80/10/10 by session, so `valid.jsonl` and `test.jsonl` are not copies of training.
+
+Each example is trimmed from the oldest context so the full target reply always fits `max_seq_length`. Examples whose target cannot fit are dropped.
+
+Training and chat use the same system prompt, the same 10-turn context budget, and the same chat-template kwargs.
 
 Media-only messages do not contain text for the model. The Audit section counts these messages separately.
 
@@ -18,16 +22,18 @@ Media-only messages do not contain text for the model. The Audit section counts 
 
 | Group | Models |
 | --- | --- |
-| Featured ≤4B | Qwen 3 4B Instruct 2507, G9v3 3B, MiniCPM5 1B, Nanbeige 4.1 3B, Nemotron 3 Nano 4B, Ministral 3 3B, Phi-4 Mini, Granite 4.1 3B, Gemma 3 4B |
+| Featured ≤4B | Qwen 3 4B Instruct 2507, Qwen 3.5 4B, G9v3 3B, MiniCPM5 1B, Nanbeige 4.1 3B, Nemotron 3 Nano 4B, Ministral 3 3B, Phi-4 Mini, Granite 4.1 3B, Gemma 3 4B |
 | Maximum on 16 GB | Qwen 3 8B, Llama 3.1 8B, Granite 4.1 8B |
 | Efficient | Qwen 3 0.6B and 1.7B, Gemma 3 1B, SmolLM3 3B |
 | Existing adapters | Qwen 2.5 0.5B, 1.5B, and 3B |
 
 The selector is curated from the [Artificial Analysis Tiny](https://artificialanalysis.ai/models/open-source/tiny) and [Small](https://artificialanalysis.ai/models/open-source/small) lists, then filtered for text chat, a compatible MLX LM architecture, a system-message chat template, 4-bit weights, and a maximum of 8B total parameters.
 
+Qwen 3 4B Instruct is the stable default because of those general benchmarks, not because Twin holdout scores picked it. Qwen 3.5 4B is a candidate. Do not treat a Quick run as evidence for either.
+
 Each choice has a separate adapter. MLX LM downloads the selected weights on the first training or chat load, not when the page opens or the selection changes. The 7B–8B choices use batch size 1 and adapt four layers to stay near the practical limit of a 16 GB Mac. Close memory-heavy apps before using them.
 
-Model keys remain tied to their original bases so an older adapter is never loaded onto incompatible weights. The broader MLX tag also contains image, audio, embedding, base, and inference-only models that Twin cannot train.
+Model keys remain tied to their original bases so an older adapter is never loaded onto incompatible weights.
 
 ## Install
 
@@ -40,31 +46,39 @@ Create the app virtual environment first. Then install the MLX training dependen
 
 Open <http://127.0.0.1:8765/twin>.
 
-Quick uses 160 recent examples and 30 steps. Use this run to make sure that local training works.
+Quick uses 160 recent examples and 30 steps. Use this run only to make sure that local training works.
 
-Complete builds the full dataset. Then it makes one pass through all generated examples unless you set a step count.
+Complete builds sessionized 1:1 pairs, holds out later sessions, and trains about three epochs with learning rate `1e-5`, warmup plus cosine decay, and gradient accumulation toward an effective batch of 8. It evaluates the real holdout during training, keeps the best checkpoint, then scores a sample of holdout generations.
 
-Each train writes a new adapter folder named with the start time, a hash of `train.jsonl`, and the step count. Earlier adapters stay on disk. Complete runs save a checkpoint at each reference evaluation. Training ends after six evaluations with no meaningful drop in reference loss, and the best checkpoint is kept. Stop mid-run and you can still chat with the last save, or continue from it.
+Each train writes a new adapter folder named with the start time, a hash of `train.jsonl`, and the step count. Earlier adapters stay on disk. Stop mid-run and you can still chat with the last save, or continue from it.
 
-The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. The Model tab can start from fresh weights or from a saved checkpoint.
+The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. Chat also retrieves two similar train-set incoming/reply pairs when `retrieve.jsonl` exists.
 
-The charts show training loss, reference loss, throughput, and peak memory. The reference sample also remains in the training file.
+The charts show training loss, holdout loss, throughput, and peak memory.
 
 ## Command line
 
-Export the complete dataset. Then train the recommended Qwen 3 4B model for one complete pass.
+Export the complete dataset for the recommended tokenizer. Then train Qwen 3 4B for the Complete recipe.
 
 ```bash
-./.venv/bin/python twin/export.py
+./.venv/bin/python twin/export.py --model-key qwen3-capable
 ./.venv/bin/python twin/train.py --model-key qwen3-capable --complete
 ./.venv/bin/python twin/train.py --model-key qwen3-capable --complete --iters 2000
 ./.venv/bin/python twin/train.py --model-key qwen3-capable --iters 500 --resume qwen3-capable/20260816-160000-ab12cd34ef56-2000/latest
 ```
 
+Score holdout replies, including greedy vs sampling and LoRA vs LoRA plus retrieval:
+
+```bash
+./.venv/bin/python twin/eval.py --model-key qwen3-capable --adapter .cache/twin/adapters/qwen3-capable/<run> --split valid
+./.venv/bin/python twin/eval.py --model-key qwen3-capable --adapter .cache/twin/adapters/qwen3-capable/<run> --retrieve --compare-decoding
+./.venv/bin/python twin/eval.py --grid
+```
+
 To train as a contact, pass a phone number or email:
 
 ```bash
-./.venv/bin/python twin/export.py --person +15555550100
+./.venv/bin/python twin/export.py --person +15555550100 --model-key qwen3-capable
 ./.venv/bin/python twin/train.py --model-key qwen3-capable --complete --person +15555550100
 ```
 
@@ -72,7 +86,7 @@ Start an interactive chat with the Qwen 3 4B adapter.
 
 ```bash
 ./.venv/bin/python twin/chat.py --model-key qwen3-capable
-./.venv/bin/python twin/chat.py --model-key qwen3-capable --person +15555550100
+./.venv/bin/python twin/chat.py --model-key qwen3-capable --no-retrieve --temp 0.4
 ./.venv/bin/python twin/chat.py --checkpoint qwen3-capable/20260816-160000-ab12cd34ef56-2000/latest
 ```
 

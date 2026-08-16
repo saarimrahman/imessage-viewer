@@ -10,7 +10,9 @@ import threading
 import time
 
 from twin.export import (
+    CONTEXT_TURNS,
     ME,
+    coerce_chat,
     dataset_profile,
     export_dataset,
     list_subjects,
@@ -19,11 +21,16 @@ from twin.export import (
     system_for,
 )
 from twin.train import (
+    COMPLETE_LR,
     DEFAULT_MODEL,
     MAX_ITERS,
+    MAX_SEQ_LENGTH,
     MODELS,
+    QUICK_LR,
     TWIN_DIR,
     adapter_dir,
+    epochs_for,
+    grad_accumulation_for,
     hash_train_file,
     has_adapter,
     has_weights,
@@ -49,7 +56,7 @@ TRAIN_RE = re.compile(
 )
 VAL_RE = re.compile(r"Iter\s+(\d+):\s+Val loss\s+([0-9.eE+-]+)")
 DOWNLOAD_RE = re.compile(r"(?i)(downloading|fetching\s+\d+\s+files)")
-HISTORY_TURNS = 10
+HISTORY_TURNS = CONTEXT_TURNS
 SMOKE_LIMIT = 160
 SMOKE_ITERS = 30
 BUSY_PHASES = (
@@ -191,7 +198,15 @@ def public_models(person_id=ME):
         {
             key: value
             for key, value in config.items()
-            if key not in ("repo", "batch_size", "layers", "chat_template_args")
+            if key not in (
+                "repo",
+                "batch_size",
+                "layers",
+                "chat_template_args",
+                "epochs",
+                "grad_accumulation",
+                "learning_rate",
+            )
         }
         | {
             "has_adapter": has_adapter(model_key, person_id=person_id),
@@ -574,19 +589,23 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
         who = "sent text" if subject["id"] == ME else f"{subject['name']}'s texts"
         _set(phase="exporting", detail=f"Building conversation pairs from {who}…")
         is_quick = run == "quick"
+        config = model_config(model_key)
         stats = export_dataset(
             limit=SMOKE_LIMIT if is_quick else 0,
             per_chat=240 if is_quick else 0,
-            augment=not is_quick,
             target_key=subject["key"],
             name=subject["name"],
+            model_key=model_key,
+            max_seq_length=MAX_SEQ_LENGTH,
+            chat_template_args=config.get("chat_template_args"),
         )
         if _cancel.is_set():
             raise TwinCancelled()
-        config = model_config(model_key)
         iters = custom_iters if custom_iters is not None else (
             SMOKE_ITERS if is_quick else steps_for_examples(
-                stats["train"], config["batch_size"]
+                stats["train"],
+                config["batch_size"],
+                epochs=epochs_for(config, complete=True),
             )
         )
         data_hash = hash_train_file(TWIN_DIR)
@@ -608,10 +627,16 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
             "sent_texts": stats["sent_texts"],
             "chats": stats["chats"],
             "augmented": stats["augmented"],
+            "valid": stats.get("valid") or 0,
+            "test": stats.get("test") or 0,
+            "sessions": stats.get("sessions") or 0,
             "iters": iters,
             "run": run,
             "batch_size": config["batch_size"],
             "layers": config["layers"],
+            "learning_rate": QUICK_LR if is_quick else COMPLETE_LR,
+            "epochs": 1 if is_quick else epochs_for(config, complete=True),
+            "grad_accumulation": 1 if is_quick else grad_accumulation_for(config),
             "resume_from": resume["id"] if resume else "",
             "status": "running",
         }
@@ -662,7 +687,7 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
                     _set(
                         best_iter=tracker.get("best_iter") or 0,
                         best_reference_loss=tracker.get("best"),
-                        detail="Reference loss plateaued. Keeping the best checkpoint…",
+                        detail="Holdout loss plateaued. Keeping the best checkpoint…",
                     )
                     _kill_proc(_proc)
             n = parse_iter(line)
@@ -672,7 +697,7 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
                     phase="training",
                     iter=n,
                     detail=(
-                        "Reference loss plateaued. Keeping the best checkpoint…"
+                        "Holdout loss plateaued. Keeping the best checkpoint…"
                         if _early_stop.is_set()
                         else f"Training {n:,}/{iters:,} steps"
                     ),
@@ -704,6 +729,12 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
                 on_proc=_remember_proc,
                 save_every=None if is_quick else steps_per_eval,
                 resume_adapter_file=resume["weights"] if resume else None,
+                learning_rate=QUICK_LR if is_quick else COMPLETE_LR,
+                grad_accumulation=1 if is_quick else grad_accumulation_for(config),
+                schedule=not is_quick,
+                run_test=not is_quick,
+                val_batches=25 if is_quick else -1,
+                chat_template_args=config.get("chat_template_args"),
             )
         except RuntimeError:
             if _cancel.is_set():
@@ -754,19 +785,36 @@ def _finish_ready(target_adapter, metadata, tracker, early, iters):
     best_loss = tracker.get("best")
     if target_adapter and best_iter:
         restore_best_checkpoint(target_adapter, best_iter)
+    scored = None
+    if target_adapter and (metadata or {}).get("run") == "complete" and not _cancel.is_set():
+        try:
+            from twin.eval import score_checkpoints
+
+            _set(detail="Scoring holdout replies…")
+            scored = score_checkpoints(
+                target_adapter,
+                TWIN_DIR,
+                metadata.get("model") or DEFAULT_MODEL,
+                split="valid",
+                max_examples=24,
+                person_name=metadata.get("person_name") or "You",
+            )
+        except Exception:
+            scored = None
     meta = {**(read_run_metadata(target_adapter) if target_adapter else {}), **(metadata or {})}
     meta.update(
         status="ready",
         early_stopped=bool(early),
         best_iter=best_iter,
         best_reference_loss=best_loss,
+        holdout_score=scored,
     )
     if target_adapter:
         write_run_metadata(target_adapter, meta)
     ready = {
         "phase": "ready",
         "detail": (
-            "Reference loss plateaued. Kept the best checkpoint."
+            "Holdout loss plateaued. Kept the best checkpoint."
             if early
             else "Adapter ready."
         ),
@@ -812,7 +860,16 @@ def _load_model(model_key, person_id=ME, run_id=None, step="latest"):
         return _model, _tokenizer
 
 
-def chat(text, history=None, model_key=DEFAULT_MODEL, person_id=ME, adapter=None):
+def chat(
+    text,
+    history=None,
+    model_key=DEFAULT_MODEL,
+    person_id=ME,
+    adapter=None,
+    retrieve_pairs=True,
+    temp=0.0,
+    top_p=0.9,
+):
     text = (text or "").strip()
     if not text:
         raise TwinError("Empty message.")
@@ -831,13 +888,23 @@ def chat(text, history=None, model_key=DEFAULT_MODEL, person_id=ME, adapter=None
         from mlx_lm import generate
 
         messages = [{"role": "system", "content": system_for(subject["name"])}]
+        shots = []
+        if retrieve_pairs:
+            from twin.retrieve import RETRIEVE_K, few_shot_messages, load_index, retrieve
+
+            pairs = retrieve(text, load_index(TWIN_DIR), k=RETRIEVE_K, exclude=[text])
+            shots = few_shot_messages(pairs)
+        live = []
         if history:
-            for turn in history[-HISTORY_TURNS:]:
+            for turn in history:
                 role = turn.get("role")
                 content = (turn.get("content") or "").strip()
                 if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": text})
+                    live.append({"role": role, "content": content})
+        live.append({"role": "user", "content": text})
+        budget = max(2, HISTORY_TURNS - len(shots))
+        live = live[-budget:]
+        messages = coerce_chat(messages + shots + live)
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -845,7 +912,14 @@ def chat(text, history=None, model_key=DEFAULT_MODEL, person_id=ME, adapter=None
             **config.get("chat_template_args", {}),
         )
         try:
-            return generate(model, tokenizer, prompt=prompt, max_tokens=96).strip()
+            kwargs = {"prompt": prompt, "max_tokens": 96}
+            if temp and temp > 0:
+                from mlx_lm.sample_utils import make_sampler
+                import mlx.core as mx
+
+                mx.random.seed(0)
+                kwargs["sampler"] = make_sampler(temp, top_p=top_p)
+            return generate(model, tokenizer, **kwargs).strip()
         except Exception as e:
             with _lock:
                 _drop_model_locked()

@@ -2180,7 +2180,7 @@ def render_twin():
 <div><strong data-stat="group_chats">—</strong><span>group chats</span></div>
 <div><strong data-stat="attachments_only">—</strong><span>media-only, skipped</span></div>
 </div>
-<p class="twin-data-copy" id="twinDataCopy">Every non-empty text you sent becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately.</p>
+<p class="twin-data-copy" id="twinDataCopy">Direct 1:1 chats are used for training. Each reply is one example. Later sessions are held out so validation is real. Group chats are counted here and left out of the adapter. Media without text cannot teach a language model and is counted separately.</p>
 </div>
 </section>
 
@@ -2231,10 +2231,10 @@ def render_twin():
 <div class="twin-metrics" id="twinMetrics"{metrics_hidden}>
 <div class="twin-section-head">
 <div><h2 id="twinMetricsTitle">How the model is learning</h2></div>
-<p class="twin-section-note">Train and reference loss on a stable sample. Complete runs stop after reference loss stops improving and keep the best checkpoint.</p>
+<p class="twin-section-note">Train and holdout loss. Holdout rows are later sessions that are not in training. Complete runs stop after holdout loss stops improving, then keep the checkpoint with the best holdout replies.</p>
 </div>
 <div class="twin-chart-grid">
-<figure class="card card-pad twin-chart"><figcaption><strong>Loss</strong><span>Lower is better</span></figcaption><svg id="twinLossChart" viewBox="0 0 520 190" role="img" aria-label="Training and reference loss"><g class="chart-grid"></g><path class="chart-line chart-train"></path><path class="chart-line chart-reference"></path><g class="chart-labels"></g></svg><div class="twin-legend"><span class="is-train">Train</span><span class="is-reference">Reference</span></div></figure>
+<figure class="card card-pad twin-chart"><figcaption><strong>Loss</strong><span>Lower is better</span></figcaption><svg id="twinLossChart" viewBox="0 0 520 190" role="img" aria-label="Training and holdout loss"><g class="chart-grid"></g><path class="chart-line chart-train"></path><path class="chart-line chart-reference"></path><g class="chart-labels"></g></svg><div class="twin-legend"><span class="is-train">Train</span><span class="is-reference">Holdout</span></div></figure>
 <figure class="card card-pad twin-chart"><figcaption><strong>Throughput</strong><span>Tokens per second</span></figcaption><svg id="twinSpeedChart" viewBox="0 0 520 190" role="img" aria-label="Training throughput"><g class="chart-grid"></g><path class="chart-line chart-speed"></path><g class="chart-labels"></g></svg><div class="twin-chart-summary"><span id="twinPeakSpeed">Waiting for training</span><span id="twinPeakMemory"></span></div></figure>
 </div>
 </div>
@@ -2247,7 +2247,7 @@ def render_twin():
 <div class="twin-progress" id="twinProgress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
 <ol class="twin-steps" id="twinSteps">
 <li data-phase="inspect"><a href="#audit"><span>1</span><div><strong>Audit archive</strong><small>Count usable text without exposing it.</small><time class="twin-step-time"></time></div></a></li>
-<li data-phase="export"><a href="#model"><span>2</span><div><strong>Build pairs</strong><small>Keep context and derive short real variants.</small><time class="twin-step-time"></time></div></a></li>
+<li data-phase="export"><a href="#model"><span>2</span><div><strong>Build pairs</strong><small>Sessionize 1:1 chats and hold out later sessions.</small><time class="twin-step-time"></time></div></a></li>
 <li data-phase="train"><a href="#model"><span>3</span><div><strong>Fit adapter</strong><small>Download weights if needed, then train on your JSONL.</small><time class="twin-step-time"></time></div></a></li>
 <li data-phase="chat"><a href="#chat"><span>4</span><div><strong>Text the twin</strong><small>Opens automatically when the adapter is ready.</small><time class="twin-step-time"></time></div></a></li>
 </ol>

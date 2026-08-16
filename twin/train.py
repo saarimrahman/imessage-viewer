@@ -32,12 +32,26 @@ MODELS = {
         "repo": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
         "download": "~2.3 GB",
         "memory": "Comfortable on 16 GB",
-        "description": "A top Tiny benchmark pick and the best default for quality, speed, and training headroom.",
+        "description": "Stable default from general Tiny benchmarks, not Twin holdout scores. Use Complete, not Quick, before judging reply quality.",
         "publisher": "Alibaba",
         "category": "Featured benchmark picks",
         "batch_size": 1,
         "layers": 8,
         "recommended": True,
+    },
+    "qwen35-4b": {
+        "key": "qwen35-4b",
+        "name": "Qwen 3.5 4B",
+        "params": "4B",
+        "repo": "mlx-community/Qwen3.5-4B-4bit",
+        "download": "~2.3 GB",
+        "memory": "Comfortable on 16 GB",
+        "description": "A Twin candidate. Compare it on holdout replies before replacing Qwen 3 4B Instruct.",
+        "publisher": "Alibaba",
+        "category": "Featured benchmark picks",
+        "batch_size": 1,
+        "layers": 8,
+        "chat_template_args": {"enable_thinking": False},
     },
     "g9v3-3b": {
         "key": "g9v3-3b",
@@ -286,6 +300,12 @@ MODEL = MODELS["compact"]["repo"]  # Backwards-compatible public constant.
 ADAPTER_WEIGHTS = "adapters.safetensors"
 LEGACY_RUN = "legacy"
 MAX_ITERS = 1_000_000
+COMPLETE_EPOCHS = 3
+COMPLETE_LR = 1e-5
+QUICK_LR = 1e-4
+EFFECTIVE_BATCH = 8
+MAX_SEQ_LENGTH = 768
+LORA_ENTRY = str(Path(__file__).resolve().parent / "mlx_lora.py")
 EARLY_STOP_PATIENCE = 6
 EARLY_STOP_MIN_DELTA = 0.01
 EARLY_STOP_MIN_EVALS = 3
@@ -570,6 +590,37 @@ def save_every_for(iters):
     return max(50, iters // 20)
 
 
+def grad_accumulation_for(config):
+    """Reach an effective batch near 8 without growing the MLX microbatch."""
+    batch = max(1, int(config.get("batch_size") or 1))
+    target = 4 if str(config.get("params") or "").startswith("8") else EFFECTIVE_BATCH
+    return max(1, target // batch)
+
+
+def epochs_for(config, complete=True):
+    if not complete:
+        return 1
+    return int(config.get("epochs") or COMPLETE_EPOCHS)
+
+
+def write_train_config(path, iters, learning_rate):
+    """Warmup plus cosine decay. MLX reads this as --config."""
+    import yaml
+
+    warmup = max(1, min(100, max(1, iters) // 20))
+    payload = {
+        "lr_schedule": {
+            "name": "cosine_decay",
+            "arguments": [float(learning_rate), int(iters), float(learning_rate) * 0.1],
+            "warmup": warmup,
+            "warmup_init": 0.0,
+        }
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, sort_keys=False)
+    return path
+
+
 def note_reference_eval(
     tracker,
     loss,
@@ -608,9 +659,9 @@ def restore_best_checkpoint(path, best_iter):
     return src
 
 
-def steps_for_examples(examples, batch_size):
-    """One complete pass through the shuffled training rows."""
-    return max(1, math.ceil(examples / max(1, batch_size)))
+def steps_for_examples(examples, batch_size, epochs=1):
+    """Microbatches to cover ``epochs`` passes through the shuffled training rows."""
+    return max(1, math.ceil(examples / max(1, batch_size)) * max(1, int(epochs)))
 
 
 def train_command(
@@ -620,18 +671,22 @@ def train_command(
     iters,
     batch_size=1,
     num_layers=8,
-    max_seq_length=768,
+    max_seq_length=MAX_SEQ_LENGTH,
     steps_per_report=10,
     steps_per_eval=100,
     save_every=None,
     resume_adapter_file=None,
+    learning_rate=COMPLETE_LR,
+    grad_accumulation=1,
+    seed=0,
+    val_batches=25,
+    config_path=None,
+    run_test=False,
 ):
     cmd = [
         sys.executable,
         "-u",
-        "-m",
-        "mlx_lm",
-        "lora",
+        LORA_ENTRY,
         "--model",
         model,
         "--train",
@@ -644,7 +699,7 @@ def train_command(
         "--batch-size",
         str(batch_size),
         "--learning-rate",
-        "1e-4",
+        str(learning_rate),
         "--max-seq-length",
         str(max_seq_length),
         "--num-layers",
@@ -655,12 +710,18 @@ def train_command(
         "--steps-per-eval",
         str(steps_per_eval),
         "--val-batches",
-        "25",
+        str(val_batches),
+        "--grad-accumulation-steps",
+        str(max(1, int(grad_accumulation))),
         "--save-every",
         str(save_every if save_every is not None else save_every_for(iters)),
         "--seed",
-        "0",
+        str(seed),
     ]
+    if config_path:
+        cmd.extend(["--config", config_path])
+    if run_test:
+        cmd.extend(["--test", "--test-batches", "-1"])
     if resume_adapter_file:
         cmd.extend(["--resume-adapter-file", resume_adapter_file])
     return cmd
@@ -679,17 +740,29 @@ def run_train(
     adapter=ADAPTER,
     batch_size=1,
     num_layers=8,
-    max_seq_length=768,
+    max_seq_length=MAX_SEQ_LENGTH,
     on_line=None,
     on_proc=None,
     save_every=None,
     resume_adapter_file=None,
+    learning_rate=COMPLETE_LR,
+    grad_accumulation=1,
+    seed=0,
+    val_batches=25,
+    schedule=False,
+    run_test=False,
+    chat_template_args=None,
 ):
     train_path = os.path.join(data, "train.jsonl")
     if not os.path.exists(train_path):
         raise FileNotFoundError("No training data. Run export first.")
     steps_per_report = max(1, iters // 120)
     steps_per_eval = max(1, iters // 12)
+    os.makedirs(adapter, exist_ok=True)
+    config_path = None
+    if schedule:
+        config_path = os.path.join(adapter, "twin_train.yaml")
+        write_train_config(config_path, iters, learning_rate)
     cmd = train_command(
         model,
         data,
@@ -702,9 +775,17 @@ def run_train(
         steps_per_eval=steps_per_eval,
         save_every=save_every if save_every is not None else save_every_for(iters),
         resume_adapter_file=resume_adapter_file,
+        learning_rate=learning_rate,
+        grad_accumulation=grad_accumulation,
+        seed=seed,
+        val_batches=val_batches,
+        config_path=config_path,
+        run_test=run_test,
     )
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    if chat_template_args:
+        env["TWIN_CHAT_TEMPLATE_ARGS"] = json.dumps(chat_template_args)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -737,8 +818,10 @@ def main():
     parser.add_argument(
         "--complete",
         action="store_true",
-        help="Use enough steps for one pass through train.jsonl",
+        help="Train for the default epoch count on train.jsonl",
     )
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--data", default=TWIN_DIR)
     parser.add_argument("--adapter")
     parser.add_argument(
@@ -769,7 +852,8 @@ def main():
                 examples = sum(1 for line in f if line.strip())
         except OSError:
             sys.exit("No training data. Run: ./.venv/bin/python twin/export.py")
-        iters = steps_for_examples(examples, config["batch_size"])
+        epochs = args.epochs if args.epochs is not None else epochs_for(config, complete=True)
+        iters = steps_for_examples(examples, config["batch_size"], epochs=epochs)
     else:
         iters = 10
 
@@ -807,6 +891,8 @@ def main():
         "run": "complete" if args.complete else "custom",
         "resume_from": args.resume or "",
         "status": "running",
+        "learning_rate": args.learning_rate or (COMPLETE_LR if args.complete else QUICK_LR),
+        "epochs": args.epochs if args.epochs is not None else epochs_for(config, complete=args.complete),
     }
     write_run_metadata(adapter, meta)
 
@@ -819,6 +905,12 @@ def main():
             batch_size=config["batch_size"],
             num_layers=config["layers"],
             resume_adapter_file=resume_file,
+            learning_rate=meta["learning_rate"],
+            grad_accumulation=grad_accumulation_for(config) if args.complete else 1,
+            schedule=bool(args.complete),
+            run_test=bool(args.complete),
+            val_batches=-1 if args.complete else 25,
+            chat_template_args=config.get("chat_template_args"),
         )
     except FileNotFoundError:
         sys.exit("No training data. Run: ./.venv/bin/python twin/export.py")

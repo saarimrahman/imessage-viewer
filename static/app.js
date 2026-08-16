@@ -673,8 +673,8 @@
       if (dataTitle) dataTitle.textContent = you ? "Your training material" : "Training material for " + name;
       if (dataCopy) {
         dataCopy.textContent = you
-          ? "Every non-empty text you sent becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately."
-          : "Every non-empty text from " + name + " becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately.";
+          ? "Direct 1:1 chats are used for training. Each reply is one example. Later sessions are held out so validation is real. Group chats are counted here and left out of the adapter. Media without text cannot teach a language model and is counted separately."
+          : "Direct 1:1 chats with " + name + " are used for training. Each of their replies is one example. Later sessions are held out so validation is real. Group chats are counted here and left out of the adapter. Media without text cannot teach a language model and is counted separately.";
       }
       if (chatTitle) chatTitle.textContent = you ? "Text your twin" : "Text " + name;
       input.placeholder = you ? "Text the twin…" : "Text " + name + "…";
@@ -901,6 +901,24 @@
       syncNewChat();
     }
 
+    function addBubbles(who, text, pendingRow) {
+      const parts = String(text || "").split("<|bubble|>").map((part) => part.trim()).filter(Boolean);
+      if (!parts.length) {
+        if (pendingRow) {
+          pendingRow.querySelector(".bubble").textContent = "";
+          pendingRow.removeAttribute("data-pending");
+        }
+        return;
+      }
+      if (pendingRow) {
+        pendingRow.querySelector(".bubble").textContent = parts[0];
+        pendingRow.removeAttribute("data-pending");
+        parts.slice(1).forEach((part) => addBubble(who, part));
+        return;
+      }
+      parts.forEach((part) => addBubble(who, part));
+    }
+
     function addBubble(who, text, pending) {
       const empty = thread.querySelector(".twin-empty");
       if (empty) empty.remove();
@@ -974,7 +992,7 @@
 
     const STEP_COPY = [
       "Count usable text without exposing it.",
-      "Keep context and derive short real variants.",
+      "Sessionize 1:1 chats and hold out later sessions.",
       "Download weights if needed, then train on your JSONL.",
       "Opens automatically when the adapter is ready.",
     ];
@@ -1337,13 +1355,13 @@
           hintEl.textContent = "Training was stopped. Saved checkpoints stay available to chat with or continue from.";
         } else if (busy && s.examples) {
           const who = isYou(selectedPerson()) ? "sent texts" : "texts";
-          hintEl.textContent = s.examples.toLocaleString() + " examples cover " + s.sent_texts.toLocaleString() + " " + who + " across " + s.chats.toLocaleString() + " chats" + (s.augmented ? ", including " + s.augmented.toLocaleString() + " short-context variants." : ".");
+          hintEl.textContent = s.examples.toLocaleString() + " train examples cover " + s.sent_texts.toLocaleString() + " " + who + " across " + s.chats.toLocaleString() + " direct chats.";
         } else if (s.early_stopped) {
-          hintEl.textContent = "Reference loss stopped improving, so training ended. Chat uses the best checkpoint. Continue from it if you want more steps.";
+          hintEl.textContent = "Holdout loss stopped improving, so training ended. Chat uses the best checkpoint. Continue from it if you want more steps.";
         } else if (modelReady) {
           hintEl.textContent = "Each train writes a new adapter. Earlier checkpoints stay in the chat list.";
         } else {
-          hintEl.textContent = "Quick uses 30 steps on a recent slice. Complete uses every chat. Leave steps blank for the default, or continue from a checkpoint.";
+          hintEl.textContent = "Quick uses 30 steps on a recent slice to check that training runs. Complete uses 1:1 sessions, a real holdout, and three epochs. Leave steps blank for that default.";
         }
       }
       if (busy && !pollTimer) {
@@ -1508,14 +1526,15 @@
         const bubble = pending.querySelector(".bubble");
         if (!res.ok) {
           bubble.textContent = data.error || "The twin could not reply.";
+          pending.removeAttribute("data-pending");
         } else {
-          bubble.textContent = data.reply;
+          addBubbles("them", data.reply, pending);
           history.push({ role: "user", content: text });
           history.push({ role: "assistant", content: data.reply });
         }
-        pending.removeAttribute("data-pending");
       } catch (err) {
         pending.querySelector(".bubble").textContent = "The twin could not reply.";
+        pending.removeAttribute("data-pending");
       }
       sending = false;
       syncNewChat();
