@@ -1,8 +1,8 @@
 # iMessage Viewer
 
-Fast local viewer for every iMessage and SMS on this Mac. Scroll chats, search them, look at photos, and read stats on how you text.
+Fast local viewer for your messages on your Mac. Scroll chats, search them, look at photos, and read stats on how you text.
 
-Nothing ever leaves this Mac. There is no cloud, no account, and no telemetry. All messages stay on your machine. Completely private.
+Nothing ever leaves your Mac. There is no cloud, no account, and no telemetry. All messages stay on your machine. Completely private.
 
 Reads `~/Library/Messages/chat.db` and Contacts. Writes indexes to `.cache/` (not in git).
 
