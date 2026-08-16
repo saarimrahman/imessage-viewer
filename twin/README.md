@@ -1,12 +1,12 @@
 # Twin
 
-Twin is a private local model that learns how you write iMessage texts. It uses MLX LM on Apple silicon.
+Twin is a private local model that learns how a person writes iMessage texts. It uses MLX LM on Apple silicon.
 
-Your messages and adapters stay on this Mac. The app stores the generated dataset and adapters in `.cache/twin/`.
+Your messages and adapters stay on this Mac. The app stores the generated dataset and adapters in `.cache/twin/`. Each contact adapter lives under `.cache/twin/people/`.
 
 ## Data coverage
 
-The Complete run uses every non-empty text that you sent. It includes direct chats, group chats, old texts, and conversation openers.
+The Complete run uses every non-empty text from the chosen person. By default that person is you. You can train as any contact. Each person keeps a separate adapter.
 
 The exporter groups nearby consecutive bubbles into one turn. A gap of more than 30 minutes starts a new turn.
 
@@ -55,10 +55,18 @@ Export the complete dataset. Then train the recommended Qwen 3 4B model for one 
 ./.venv/bin/python twin/train.py --model-key qwen3-capable --complete
 ```
 
+To train as a contact, pass a phone number or email:
+
+```bash
+./.venv/bin/python twin/export.py --person +15555550100
+./.venv/bin/python twin/train.py --model-key qwen3-capable --complete --person +15555550100
+```
+
 Start an interactive chat with the Qwen 3 4B adapter.
 
 ```bash
 ./.venv/bin/python twin/chat.py --model-key qwen3-capable
+./.venv/bin/python twin/chat.py --model-key qwen3-capable --person +15555550100
 ```
 
 Use `--once` for one reply.

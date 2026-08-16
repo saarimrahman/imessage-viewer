@@ -37,3 +37,8 @@ The first start builds the search index in the background.
 - Volume: daily heatmap, monthly sent vs received, most contacted
 - People: eras, who held each year, who is fading in or out, long-term friends, people you fell out of touch with
 - How you talk: reply speed, who starts conversations, tapbacks, words and phrases
+
+## Circles
+
+- A map of how people overlap through group chats
+- Faces are people, pills are the groups they share; a ring marks someone in three or more circles

@@ -8,7 +8,15 @@ import signal
 import threading
 import time
 
-from twin.export import SYSTEM, dataset_profile, export_dataset
+from twin.export import (
+    ME,
+    dataset_profile,
+    export_dataset,
+    list_subjects,
+    parse_person_arg,
+    resolve_subject,
+    system_for,
+)
 from twin.train import (
     DEFAULT_MODEL,
     MODELS,
@@ -67,6 +75,8 @@ _state = {
     "chats": 0,
     "augmented": 0,
     "model": DEFAULT_MODEL,
+    "person": ME,
+    "person_name": "You",
     "run": "complete",
     "metrics": [],
     "started_at": None,
@@ -153,7 +163,7 @@ def cached_model_repos():
         return set()
 
 
-def public_models():
+def public_models(person_id=ME):
     cached = cached_model_repos()
     return [
         {
@@ -162,7 +172,7 @@ def public_models():
             if key not in ("repo", "batch_size", "layers", "chat_template_args")
         }
         | {
-            "has_adapter": has_adapter(model_key),
+            "has_adapter": has_adapter(model_key, person_id=person_id),
             "cached": config["repo"] in cached,
         }
         for model_key, config in MODELS.items()
@@ -197,9 +207,13 @@ def snapshot(brief=False):
     with _lock:
         phase = _state["phase"]
         model_key = _state["model"]
+        person_id = _state.get("person") or ME
+        person_name = _state.get("person_name") or "You"
         started_at = _state.get("started_at")
         phase_seconds = dict(_state.get("phase_seconds") or {})
         phase_started = _state.get("phase_started_at")
+        if phase not in BUSY_PHASES:
+            _abandon_stale_runs_locked()
         if phase in BUSY_PHASES and phase_started:
             phase_seconds[phase] = now - phase_started
         eta = estimate_eta(
@@ -219,9 +233,11 @@ def snapshot(brief=False):
             "chats": _state["chats"],
             "augmented": _state["augmented"],
             "model": model_key,
+            "person": person_id,
+            "person_name": person_name,
             "run": _state["run"],
             "busy": phase in BUSY_PHASES,
-            "has_adapter": has_adapter(model_key),
+            "has_adapter": has_adapter(model_key, person_id=person_id),
             "started_at": started_at,
             "phase_started_at": phase_started,
             "train_started_at": _state.get("train_started_at"),
@@ -238,20 +254,45 @@ def snapshot(brief=False):
             return out
         return out | {
             "metrics": [dict(point) for point in _state["metrics"]],
-            "models": public_models(),
+            "models": public_models(person_id),
             "runs": [dict(row) for row in _runs_locked()[:MAX_RUNS]],
         }
 
 
-def inspect_data():
-    return dataset_profile()
+def inspect_data(person_id=ME):
+    try:
+        person_id = parse_person_arg(person_id)
+        subject = resolve_subject(person_id)
+    except ValueError as e:
+        raise TwinError(str(e)) from e
+    return dataset_profile(target_key=subject["key"], handles=subject.get("handles"))
 
 
-def start_train(run="complete", model_key=DEFAULT_MODEL):
+def list_people():
+    from contacts import avatar_html
+
+    return [
+        {
+            "id": subject["id"],
+            "name": subject["name"],
+            "handle": subject["handle"],
+            "texts": subject["texts"],
+            "trained": [
+                key for key in MODELS if has_adapter(key, person_id=subject["id"])
+            ],
+            "avatar": avatar_html(subject["name"], subject["handle"]),
+        }
+        for subject in list_subjects()
+    ]
+
+
+def start_train(run="complete", model_key=DEFAULT_MODEL, person_id=ME):
     if run not in ("quick", "complete"):
         return False, "run must be quick or complete"
     try:
         config = model_config(model_key)
+        person_id = parse_person_arg(person_id)
+        subject = resolve_subject(person_id)
     except ValueError as e:
         return False, str(e)
     now = time.time()
@@ -269,6 +310,8 @@ def start_train(run="complete", model_key=DEFAULT_MODEL):
             chats=0,
             augmented=0,
             model=model_key,
+            person=subject["id"],
+            person_name=subject["name"],
             run=run,
             metrics=[],
             started_at=now,
@@ -278,14 +321,18 @@ def start_train(run="complete", model_key=DEFAULT_MODEL):
             phase_seconds={},
         )
         _drop_model_locked()
-        _begin_run_locked(config, run, now)
-    threading.Thread(target=_train_worker, args=(run, model_key), daemon=True).start()
+        _begin_run_locked(config, run, now, subject)
+    threading.Thread(
+        target=_train_worker, args=(run, model_key, subject), daemon=True
+    ).start()
     return True, ""
 
 
 def stop_train():
     with _lock:
         if _state["phase"] not in BUSY_PHASES:
+            if _abandon_stale_runs_locked():
+                return True, ""
             return False, "not training"
         proc = _proc
         _cancel.set()
@@ -347,6 +394,31 @@ def _kill_proc(proc):
             pass
 
 
+def _abandon_stale_runs_locked():
+    """A reload or crash can leave a running row after the trainer is idle."""
+    if _state["phase"] in BUSY_PHASES:
+        return False
+    runs = _runs_locked()
+    now = time.time()
+    changed = False
+    for row in runs:
+        if row.get("status") != "running":
+            continue
+        started = row.get("started_at") or now
+        row.update(
+            {
+                "status": "cancelled",
+                "ended_at": now,
+                "elapsed_seconds": now - started,
+                "detail": "Training was interrupted.",
+            }
+        )
+        changed = True
+    if changed:
+        _save_runs_locked(runs)
+    return changed
+
+
 def _runs_locked():
     global _runs
     if _runs is None:
@@ -367,13 +439,15 @@ def _save_runs_locked(runs):
         json.dump(_runs, f)
 
 
-def _begin_run_locked(config, run, now):
+def _begin_run_locked(config, run, now, subject):
     row = {
         "id": f"{now:.3f}",
         "model": config["key"],
         "name": config["name"],
         "params": config["params"],
         "run": run,
+        "person": subject["id"],
+        "person_name": subject["name"],
         "status": "running",
         "started_at": now,
     }
@@ -415,23 +489,26 @@ def _complete_run(status):
         _save_runs_locked(runs)
 
 
-def _train_worker(run, model_key):
+def _train_worker(run, model_key, subject):
     # MLX generation and training share the same GPU memory pool. Let an active
     # reply finish before training starts, then block new replies until it ends.
     with _gen_lock:
-        _train_worker_exclusive(run, model_key)
+        _train_worker_exclusive(run, model_key, subject)
 
 
-def _train_worker_exclusive(run, model_key):
+def _train_worker_exclusive(run, model_key, subject):
     try:
         if _cancel.is_set():
             raise TwinCancelled()
-        _set(phase="exporting", detail="Building conversation pairs from sent text…")
+        who = "sent text" if subject["id"] == ME else f"{subject['name']}'s texts"
+        _set(phase="exporting", detail=f"Building conversation pairs from {who}…")
         is_quick = run == "quick"
         stats = export_dataset(
             limit=SMOKE_LIMIT if is_quick else 0,
             per_chat=240 if is_quick else 0,
             augment=not is_quick,
+            target_key=subject["key"],
+            name=subject["name"],
         )
         if _cancel.is_set():
             raise TwinCancelled()
@@ -489,7 +566,7 @@ def _train_worker_exclusive(run, model_key):
 
         if _cancel.is_set():
             raise TwinCancelled()
-        target_adapter = adapter_dir(model_key)
+        target_adapter = adapter_dir(model_key, subject["id"])
         try:
             run_train(
                 iters=iters,
@@ -511,6 +588,8 @@ def _train_worker_exclusive(run, model_key):
             {
                 "model": model_key,
                 "repo": config["repo"],
+                "person": subject["id"],
+                "person_name": subject["name"],
                 "examples": stats["train"],
                 "sent_texts": stats["sent_texts"],
                 "chats": stats["chats"],
@@ -531,15 +610,16 @@ def _train_worker_exclusive(run, model_key):
         _remember_proc(None)
 
 
-def _load_model(model_key):
+def _load_model(model_key, person_id=ME):
     global _model, _tokenizer, _loaded_key
     config = model_config(model_key)
+    loaded = (model_key, person_id)
     with _lock:
-        if _model is not None and _loaded_key == model_key:
+        if _model is not None and _loaded_key == loaded:
             return _model, _tokenizer
         if _state["phase"] in BUSY_PHASES:
             raise TwinError("Training is running. Wait for it to finish.")
-        if not has_adapter(model_key):
+        if not has_adapter(model_key, person_id=person_id):
             raise TwinError(f"{config['name']} has not been trained yet.")
         if not mlx_installed():
             raise TwinError(
@@ -550,28 +630,30 @@ def _load_model(model_key):
         from mlx_lm import load
 
         model, tokenizer = load(
-            config["repo"], adapter_path=resolved_adapter_dir(model_key)
+            config["repo"], adapter_path=resolved_adapter_dir(model_key, person_id)
         )
     except Exception as e:
         raise TwinError(f"Could not load {config['name']}: {e}") from e
     with _lock:
-        _model, _tokenizer, _loaded_key = model, tokenizer, model_key
+        _model, _tokenizer, _loaded_key = model, tokenizer, loaded
         return _model, _tokenizer
 
 
-def chat(text, history=None, model_key=DEFAULT_MODEL):
+def chat(text, history=None, model_key=DEFAULT_MODEL, person_id=ME):
     text = (text or "").strip()
     if not text:
         raise TwinError("Empty message.")
     try:
         config = model_config(model_key)
+        person_id = parse_person_arg(person_id)
+        subject = resolve_subject(person_id)
     except ValueError as e:
         raise TwinError(str(e)) from e
     with _gen_lock:
-        model, tokenizer = _load_model(model_key)
+        model, tokenizer = _load_model(model_key, person_id)
         from mlx_lm import generate
 
-        messages = [{"role": "system", "content": SYSTEM}]
+        messages = [{"role": "system", "content": system_for(subject["name"])}]
         if history:
             for turn in history[-HISTORY_TURNS:]:
                 role = turn.get("role")

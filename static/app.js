@@ -596,7 +596,8 @@
     const input = document.getElementById("twinInput");
     const thread = document.getElementById("twinThread");
     const form = document.getElementById("twinCompose");
-    const chatModelEl = document.getElementById("twinChatModel");
+    const chatPicker = document.getElementById("twinChatPicker");
+    const chatSelect = document.getElementById("twinChatSelect");
     const TABS = ["audit", "model", "chat"];
     const tabButtons = Array.from(page.querySelectorAll(".twin-tab"));
     const panels = Array.from(page.querySelectorAll(".twin-panel"));
@@ -609,19 +610,155 @@
     const modelDownloadedEl = document.getElementById("twinModelDownloaded");
     const modelTrainedEl = document.getElementById("twinModelTrained");
     const stepEls = Array.from(page.querySelectorAll("#twinSteps li"));
+    const whoBtn = document.getElementById("twinWhoBtn");
+    const whoMenu = document.getElementById("twinWhoMenu");
+    const whoSearch = document.getElementById("twinWhoSearch");
+    const whoList = document.getElementById("twinWhoList");
+    const whoNameEl = document.getElementById("twinWhoName");
+    const whoAvatarEl = document.getElementById("twinWhoAvatar");
+    const PERSON_KEY = "twin-person";
     const WAITING_PHASES = ["inspecting", "exporting", "downloading", "loading"];
     const history = [];
     let pollTimer = null;
     let sending = false;
     let lastStatus = null;
     let wasBusy = page.classList.contains("is-busy");
+    let people = [];
+    let personId = page.dataset.person || "me";
 
     function selectedModel() {
       return modelSelect.value || "qwen3-capable";
     }
 
     function selectedModelInfo(s) {
-      return (s.models || []).find((model) => model.key === selectedModel());
+      return modelsForPerson(s).find((model) => model.key === selectedModel());
+    }
+
+    function selectedPerson() {
+      return people.find((person) => person.id === personId) || people[0] || { id: "me", name: "You", trained: [] };
+    }
+
+    function isYou(person) {
+      return !person || person.id === "me";
+    }
+
+    function personTrained(modelKey) {
+      const person = selectedPerson();
+      return !!(person.trained && person.trained.indexOf(modelKey) >= 0);
+    }
+
+    function modelsForPerson(s) {
+      const models = s.models || [];
+      if (!people.length) return models;
+      return models.map((model) => Object.assign({}, model, {
+        has_adapter: personTrained(model.key),
+      }));
+    }
+
+    function applyPersonCopy(person) {
+      const you = isYou(person);
+      const name = (person && person.name) || "You";
+      const lede = document.getElementById("twinLede");
+      const dataTitle = document.getElementById("twinDataTitle");
+      const dataCopy = document.getElementById("twinDataCopy");
+      const chatTitle = document.getElementById("twinChatTitle");
+      if (lede) {
+        lede.textContent = you
+          ? "Fine-tune a private local model on the way you actually text. Messages and adapters never leave this Mac."
+          : "Fine-tune a private local model on how " + name + " actually texts. Messages and adapters never leave this Mac.";
+      }
+      if (dataTitle) dataTitle.textContent = you ? "Your training material" : "Training material for " + name;
+      if (dataCopy) {
+        dataCopy.textContent = you
+          ? "Every non-empty text you sent becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately."
+          : "Every non-empty text from " + name + " becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately.";
+      }
+      if (chatTitle) chatTitle.textContent = you ? "Text your twin" : "Text " + name;
+      input.placeholder = you ? "Text the twin…" : "Text " + name + "…";
+      if (whoNameEl) whoNameEl.textContent = name;
+      if (whoAvatarEl && person && person.avatar) whoAvatarEl.innerHTML = person.avatar;
+      page.dataset.person = person ? person.id : "me";
+      emptyState();
+    }
+
+    function closeWho() {
+      if (!whoMenu || whoMenu.hidden) return;
+      whoMenu.hidden = true;
+      if (whoBtn) whoBtn.setAttribute("aria-expanded", "false");
+      page.classList.remove("is-who-open");
+    }
+
+    function renderWhoList() {
+      if (!whoList) return;
+      const q = (whoSearch && whoSearch.value ? whoSearch.value : "").trim().toLowerCase();
+      whoList.replaceChildren();
+      people.forEach((person) => {
+        const hay = ((person.name || "") + " " + (person.handle || "")).toLowerCase();
+        if (q && hay.indexOf(q) < 0) return;
+        const li = document.createElement("li");
+        li.className = "twin-who-option" + (person.id === personId ? " is-selected" : "");
+        li.setAttribute("role", "option");
+        li.setAttribute("aria-selected", person.id === personId ? "true" : "false");
+        li.dataset.id = person.id;
+        const avatar = document.createElement("span");
+        avatar.className = "twin-who-avatar";
+        avatar.innerHTML = person.avatar || "";
+        const body = document.createElement("span");
+        body.className = "twin-who-option-copy";
+        const name = document.createElement("strong");
+        name.textContent = person.name;
+        const meta = document.createElement("span");
+        const bits = [];
+        if (person.texts) {
+          bits.push(person.texts.toLocaleString() + (person.id === "me" ? " sent" : " texts"));
+        }
+        if (person.trained && person.trained.length) bits.push("trained");
+        meta.textContent = bits.join(" · ");
+        body.append(name, meta);
+        li.append(avatar, body);
+        whoList.appendChild(li);
+      });
+      if (!whoList.childElementCount) {
+        const empty = document.createElement("li");
+        empty.className = "twin-who-empty";
+        empty.textContent = "No matching contacts.";
+        whoList.appendChild(empty);
+      }
+    }
+
+    function openWho() {
+      if (!whoMenu || !whoBtn || whoBtn.disabled) return;
+      whoMenu.hidden = false;
+      whoBtn.setAttribute("aria-expanded", "true");
+      page.classList.add("is-who-open");
+      if (whoSearch) whoSearch.value = "";
+      renderWhoList();
+      if (whoSearch) whoSearch.focus();
+    }
+
+    function selectPerson(id, fromUser) {
+      const person = people.find((item) => item.id === id);
+      if (!person) return;
+      const changed = person.id !== personId;
+      personId = person.id;
+      try { localStorage.setItem(PERSON_KEY, personId); } catch (err) {}
+      applyPersonCopy(person);
+      closeWho();
+      if (fromUser && changed) {
+        history.length = 0;
+        thread.replaceChildren();
+        emptyState();
+        loadDataProfile();
+        if (lastStatus) applyStatus(lastStatus);
+      }
+    }
+
+    function chatModel() {
+      return chatSelect.value || "";
+    }
+
+    function chatModelInfo(s) {
+      return modelsForPerson(s).find((model) => model.key === chatModel());
     }
 
     function showTab(name, fromUser) {
@@ -661,14 +798,29 @@
 
     function emptyState() {
       if (thread.querySelector(".row")) return;
-      if (thread.querySelector(".twin-empty")) return;
+      const person = selectedPerson();
+      const you = isYou(person);
+      const trained = !!(chatPicker && !chatPicker.hidden && chatSelect.options.length);
+      const key = String(trained) + ":" + (person.id || "me");
+      const existing = thread.querySelector(".twin-empty");
+      if (existing && existing.dataset.key === key) return;
+      if (existing) existing.remove();
       const p = document.createElement("p");
       p.className = "twin-empty";
-      p.append("Train a model, then text it here. You are on the right; your twin replies on the left. ");
-      const a = document.createElement("a");
-      a.href = "#model";
-      a.textContent = "Choose a model";
-      p.append(a);
+      p.dataset.key = key;
+      if (trained) {
+        p.append(you
+          ? "You are on the right; your twin replies on the left."
+          : "You are on the right; " + person.name + " replies on the left.");
+      } else {
+        p.append(you
+          ? "Train a model, then text it here. You are on the right; your twin replies on the left. "
+          : "Train a model as " + person.name + ", then text them here. You are on the right; they reply on the left. ");
+        const a = document.createElement("a");
+        a.href = "#model";
+        a.textContent = "Choose a model";
+        p.append(a);
+      }
       thread.appendChild(p);
     }
 
@@ -769,7 +921,11 @@
         el.classList.toggle("is-done", index < active || (index === 3 && hasAdapter));
         const small = el.querySelector("small");
         if (small) {
-          small.textContent = (index === active && STEP_LIVE[phase]) ? STEP_LIVE[phase] : STEP_COPY[index];
+          let live = STEP_LIVE[phase];
+          if (index === active && phase === "training" && !isYou(selectedPerson())) {
+            live = "Retraining the adapter on " + selectedPerson().name + "’s texts…";
+          }
+          small.textContent = (index === active && live) ? live : STEP_COPY[index];
         }
         const timeEl = el.querySelector(".twin-step-time");
         if (!timeEl) return;
@@ -814,11 +970,29 @@
     }
 
     function syncModelPicker(s) {
-      (s.models || []).forEach((model) => {
+      modelsForPerson(s).forEach((model) => {
         const option = Array.from(modelSelect.options).find((item) => item.value === model.key);
         if (!option) return;
         option.textContent = model.name + " — " + model.params + " · " + model.download + (model.has_adapter ? " · trained" : "");
       });
+    }
+
+    function syncChatPicker(s) {
+      const trained = modelsForPerson(s).filter((model) => model.has_adapter);
+      const prev = chatSelect.value;
+      const preferred = trained.some((model) => model.key === prev)
+        ? prev
+        : (trained.some((model) => model.key === s.model) ? s.model : (trained[0] && trained[0].key) || "");
+      chatSelect.replaceChildren();
+      trained.forEach((model) => {
+        const option = document.createElement("option");
+        option.value = model.key;
+        option.textContent = model.name + " · " + model.params;
+        chatSelect.appendChild(option);
+      });
+      if (preferred) chatSelect.value = preferred;
+      chatPicker.hidden = trained.length === 0;
+      chatSelect.disabled = !!s.busy || trained.length === 0;
     }
 
     function updateModelSummary(model) {
@@ -849,7 +1023,7 @@
     }
 
     function liveRun(row, live) {
-      if (!live || row.status !== "running") return row;
+      if (!live || !live.busy || row.status !== "running") return row;
       const losses = latestLosses(live.metrics);
       return Object.assign({}, row, {
         elapsed_seconds: live.elapsed_seconds,
@@ -875,21 +1049,22 @@
       return wrap;
     }
 
-    function openRunProgress() {
+    function showTrainingScreen() {
+      revealSignals(true);
       showTab("model", true);
       setHash("model");
-      const metrics = document.getElementById("twinMetrics");
-      const live = document.getElementById("twinLive");
-      const hasChart = metrics && !metrics.hidden && ((lastStatus && lastStatus.metrics) || []).length > 0;
-      const target = hasChart ? metrics : live;
-      if (!target) return;
-      document.querySelectorAll(".twin-metrics.is-revealed, .twin-live.is-revealed").forEach((el) => {
-        el.classList.remove("is-revealed");
-      });
+    }
+
+    function openRunProgress() {
+      if (lastStatus && lastStatus.model) modelSelect.value = lastStatus.model;
+      showTrainingScreen();
+      if (lastStatus) applyStatus(lastStatus);
+      const trainCard = page.querySelector(".twin-train");
       requestAnimationFrame(() => {
-        target.scrollIntoView({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
-        target.classList.add("is-revealed");
-        window.setTimeout(() => target.classList.remove("is-revealed"), reduceMotion ? 0 : 1200);
+        (trainCard || metricsEl).scrollIntoView({
+          block: "start",
+          behavior: reduceMotion ? "auto" : "smooth",
+        });
       });
     }
 
@@ -897,7 +1072,7 @@
       const box = document.getElementById("twinRuns");
       const list = document.getElementById("twinRunList");
       if (!box || !list) return;
-      const rows = runs || [];
+      const rows = (runs || []).filter((row) => (row.person || "me") === personId);
       box.hidden = rows.length === 0;
       list.replaceChildren();
       rows.forEach((raw) => {
@@ -944,12 +1119,21 @@
           sub.append(size);
         }
         if (kind === "running") {
+          const actions = document.createElement("div");
+          actions.className = "twin-run-actions";
           const open = document.createElement("a");
           open.className = "twin-run-open";
-          open.href = "#twinLive";
+          open.href = "#model";
           open.textContent = "View progress";
           open.setAttribute("aria-label", "View progress for " + (row.name || "this run"));
-          sub.append(open);
+          const stop = document.createElement("button");
+          stop.type = "button";
+          stop.className = "btn twin-run-stop";
+          stop.textContent = "Stop";
+          stop.setAttribute("aria-label", "Stop training " + (row.name || "this run"));
+          if (live && live.phase === "cancelling") stop.disabled = true;
+          actions.append(open, stop);
+          sub.append(actions);
         }
 
         const stats = document.createElement("dl");
@@ -987,14 +1171,18 @@
       trainBtn.disabled = busy || !s.mlx;
       stopBtn.hidden = !busy;
       stopBtn.disabled = s.phase === "cancelling";
-      sendBtn.disabled = busy || !modelReady;
-      input.disabled = busy || !modelReady;
       modelSelect.disabled = busy;
+      if (whoBtn) {
+        whoBtn.disabled = busy;
+        if (busy) closeWho();
+      }
       syncModelPicker(s);
       updateModelSummary(model);
-      chatModelEl.textContent = model
-        ? model.name + " · " + model.params + (modelReady ? " · ready" : " · not trained")
-        : "Select a trained model in Model.";
+      syncChatPicker(s);
+      const chatting = chatModelInfo(s);
+      const chatReady = !!(chatting && chatting.has_adapter);
+      sendBtn.disabled = busy || !chatReady || sending;
+      input.disabled = busy || !chatReady;
       if (!s.mlx) {
         statusEl.textContent = "mlx-lm is not installed.";
       } else if (WAITING_PHASES.includes(s.phase) || s.phase === "training" || s.phase === "cancelling") {
@@ -1033,10 +1221,20 @@
       page.classList.toggle("is-busy", busy);
       page.classList.toggle("is-error", s.phase === "error");
       if (wasBusy && !busy && s.phase === "ready") {
+        const person = selectedPerson();
+        if (person && s.model && person.trained && person.trained.indexOf(s.model) < 0) {
+          person.trained.push(s.model);
+        }
+        if (s.model && Array.from(chatSelect.options).some((opt) => opt.value === s.model) && chatSelect.value !== s.model) {
+          chatSelect.value = s.model;
+          history.length = 0;
+          thread.replaceChildren();
+        }
         showTab("chat", true);
         setHash("chat");
       }
       wasBusy = busy;
+      emptyState();
       if (hintEl) {
         if (!s.mlx) {
           hintEl.innerHTML =
@@ -1047,7 +1245,8 @@
         } else if (s.phase === "cancelled") {
           hintEl.textContent = "Training was stopped. Start again when you want to fit this model.";
         } else if (busy && s.examples) {
-          hintEl.textContent = s.examples.toLocaleString() + " examples cover " + s.sent_texts.toLocaleString() + " sent texts across " + s.chats.toLocaleString() + " chats" + (s.augmented ? ", including " + s.augmented.toLocaleString() + " short-context variants." : ".");
+          const who = isYou(selectedPerson()) ? "sent texts" : "texts";
+          hintEl.textContent = s.examples.toLocaleString() + " examples cover " + s.sent_texts.toLocaleString() + " " + who + " across " + s.chats.toLocaleString() + " chats" + (s.augmented ? ", including " + s.augmented.toLocaleString() + " short-context variants." : ".");
         } else if (modelReady) {
           hintEl.textContent = "This adapter stays paired with " + model.name + ". Training another size creates a separate adapter.";
         } else {
@@ -1063,10 +1262,26 @@
       }
     }
 
+    async function loadPeople() {
+      try {
+        const res = await fetch("/twin/people");
+        const data = await res.json();
+        people = data.people || [];
+        let stored = null;
+        try { stored = localStorage.getItem(PERSON_KEY); } catch (err) {}
+        const busyPerson = lastStatus && lastStatus.busy ? lastStatus.person : null;
+        const initial = busyPerson || (stored && people.some((person) => person.id === stored) ? stored : "me");
+        personId = people.some((person) => person.id === initial) ? initial : "me";
+        applyPersonCopy(selectedPerson());
+        renderWhoList();
+        if (lastStatus) applyStatus(lastStatus);
+      } catch (err) {}
+    }
+
     async function loadDataProfile() {
       const note = document.getElementById("twinDataNote");
       try {
-        const res = await fetch("/twin/data");
+        const res = await fetch("/twin/data?person=" + encodeURIComponent(personId));
         const profile = await res.json();
         if (!res.ok) throw new Error(profile.error || "Cannot inspect messages");
         page.querySelectorAll("[data-stat]").forEach((el) => {
@@ -1088,33 +1303,36 @@
       }
     }
 
-    stopBtn.addEventListener("click", async () => {
-      stopBtn.disabled = true;
+    async function stopTrain() {
+      const buttons = [stopBtn, ...page.querySelectorAll(".twin-run-stop")];
+      buttons.forEach((btn) => { btn.disabled = true; });
       try {
         const res = await fetch("/twin/stop", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}",
         });
-        applyStatus(await res.json());
+        const data = await res.json();
+        applyStatus(data);
+        if (!res.ok && data.error) statusEl.textContent = data.error;
       } catch (err) {
-        stopBtn.disabled = false;
+        buttons.forEach((btn) => { btn.disabled = false; });
         statusEl.textContent = "Could not stop training.";
       }
-    });
+    }
+
+    stopBtn.addEventListener("click", stopTrain);
 
     trainBtn.addEventListener("click", async () => {
       const run = (page.querySelector('input[name="twinrun"]:checked') || {}).value || "complete";
       const model = selectedModel();
       trainBtn.disabled = true;
-      revealSignals(true);
-      showTab("model", true);
-      setHash("model");
+      showTrainingScreen();
       try {
         const res = await fetch("/twin/train", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ run, model }),
+          body: JSON.stringify({ run, model, person: personId }),
         });
         const data = await res.json();
         applyStatus(data);
@@ -1126,10 +1344,42 @@
     });
 
     modelSelect.addEventListener("change", () => {
+      if (lastStatus) applyStatus(lastStatus);
+    });
+
+    chatSelect.addEventListener("change", () => {
       history.length = 0;
       thread.replaceChildren();
       emptyState();
       if (lastStatus) applyStatus(lastStatus);
+    });
+
+    if (whoBtn) {
+      whoBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (whoBtn.disabled) return;
+        if (whoMenu.hidden) openWho();
+        else closeWho();
+      });
+    }
+    if (whoSearch) whoSearch.addEventListener("input", renderWhoList);
+    if (whoList) {
+      whoList.addEventListener("click", (e) => {
+        const option = e.target.closest("[data-id]");
+        if (!option) return;
+        selectPerson(option.dataset.id, true);
+      });
+    }
+    document.addEventListener("click", (e) => {
+      if (!whoMenu || whoMenu.hidden) return;
+      if (e.target.closest("#twinWho")) return;
+      closeWho();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && whoMenu && !whoMenu.hidden) {
+        closeWho();
+        if (whoBtn) whoBtn.focus();
+      }
     });
 
     form.addEventListener("submit", async (e) => {
@@ -1145,7 +1395,7 @@
         const res = await fetch("/twin/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, history, model: selectedModel() }),
+          body: JSON.stringify({ text, history, model: chatModel(), person: personId }),
         });
         const data = await res.json();
         const bubble = pending.querySelector(".bubble");
@@ -1193,12 +1443,520 @@
       showTab(tabFromLocation());
     });
     document.getElementById("twinRunList").addEventListener("click", (e) => {
+      if (e.target.closest(".twin-run-stop")) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!e.target.closest(".twin-run-stop").disabled) stopTrain();
+        return;
+      }
       if (!e.target.closest(".twin-run.is-openable")) return;
       e.preventDefault();
       openRunProgress();
     });
+    loadPeople();
     loadDataProfile();
     refreshStatus();
+  }
+
+  function initCircles() {
+    const page = document.getElementById("circlesPage");
+    const dataEl = document.getElementById("circlesData");
+    const viewport = document.getElementById("circlesViewport");
+    const world = document.getElementById("circlesWorld");
+    const svg = document.getElementById("circlesEdges");
+    const nodeLayer = document.getElementById("circlesNodes");
+    const sheet = document.getElementById("circlesSheet");
+    const find = document.getElementById("circlesFind");
+    if (!page || !dataEl || !viewport || !world || !svg || !nodeLayer || !sheet) return;
+
+    const data = JSON.parse(dataEl.textContent);
+    if (!data.groups || !data.groups.length) return;
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const OFFSET = 2000;
+    const cam = { x: 0, y: 0, k: 1 };
+    const nodes = [];
+    const byId = {};
+    let selected = null;
+    let alpha = 1;
+    let running = false;
+    let userMoved = false;
+    let drag = null;
+
+    function applyCam() {
+      world.style.transform = "translate(" + cam.x + "px, " + cam.y + "px) scale(" + cam.k + ")";
+    }
+
+    function toWorld(clientX, clientY) {
+      const rect = viewport.getBoundingClientRect();
+      return {
+        x: (clientX - rect.left - cam.x) / cam.k,
+        y: (clientY - rect.top - cam.y) / cam.k,
+      };
+    }
+
+    function fit(glide) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      nodes.forEach((n) => {
+        minX = Math.min(minX, n.x - n.r);
+        minY = Math.min(minY, n.y - n.r);
+        maxX = Math.max(maxX, n.x + n.r);
+        maxY = Math.max(maxY, n.y + n.r);
+      });
+      const bw = Math.max(maxX - minX, 80);
+      const bh = Math.max(maxY - minY, 80);
+      const rect = viewport.getBoundingClientRect();
+      const pad = 96;
+      cam.k = Math.min(1.2, Math.max(0.32, Math.min((rect.width - pad) / bw, (rect.height - pad) / bh)));
+      cam.x = rect.width / 2 - ((minX + maxX) / 2) * cam.k;
+      cam.y = rect.height / 2 - ((minY + maxY) / 2) * cam.k;
+      if (glide && !reduceMotion) {
+        world.classList.add("is-gliding");
+        world.addEventListener("transitionend", () => world.classList.remove("is-gliding"), { once: true });
+      }
+      applyCam();
+    }
+
+    function panTo(n) {
+      const rect = viewport.getBoundingClientRect();
+      cam.k = Math.max(cam.k, 1);
+      cam.x = rect.width / 2 - n.x * cam.k;
+      cam.y = rect.height / 2 - n.y * cam.k;
+      if (!reduceMotion) {
+        world.classList.add("is-gliding");
+        world.addEventListener("transitionend", () => world.classList.remove("is-gliding"), { once: true });
+      }
+      applyCam();
+    }
+
+    function makeAvatar(person) {
+      if (person.avatar) {
+        const img = document.createElement("img");
+        img.className = "avatar";
+        img.src = "/avatar/" + person.avatar;
+        img.alt = "";
+        return img;
+      }
+      const span = document.createElement("span");
+      span.className = "avatar";
+      span.style.background = person.color || "#007aff";
+      span.textContent = (person.name || "?").trim().slice(0, 1).toUpperCase();
+      return span;
+    }
+
+    data.groups.forEach((g) => {
+      const n = {
+        id: g.id,
+        kind: "group",
+        data: g,
+        x: 0, y: 0, vx: 0, vy: 0,
+        r: Math.min(72, 28 + g.name.length * 2.1),
+        mass: 4,
+        fx: null, fy: null,
+      };
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "cnode cnode-group";
+      el.dataset.id = g.id;
+      el.setAttribute("aria-label", g.name);
+      const label = document.createElement("span");
+      label.className = "cnode-label";
+      label.textContent = g.name;
+      const count = document.createElement("span");
+      count.className = "cnode-n";
+      count.textContent = String(g.member_ids.length);
+      el.append(label, count);
+      n.el = el;
+      nodes.push(n);
+      byId[g.id] = n;
+      nodeLayer.appendChild(el);
+    });
+
+    data.people.forEach((p) => {
+      const bridge = p.group_ids.length > 2;
+      const n = {
+        id: p.id,
+        kind: "person",
+        data: p,
+        x: 0, y: 0, vx: 0, vy: 0,
+        r: bridge ? 22 : 18,
+        mass: 1,
+        fx: null, fy: null,
+      };
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "cnode cnode-person" + (bridge ? " is-bridge" : "");
+      el.dataset.id = p.id;
+      el.setAttribute("aria-label", p.name);
+      el.appendChild(makeAvatar(p));
+      const tip = document.createElement("span");
+      tip.className = "cnode-tip";
+      tip.textContent = p.name;
+      el.appendChild(tip);
+      n.el = el;
+      nodes.push(n);
+      byId[p.id] = n;
+      nodeLayer.appendChild(el);
+    });
+
+    const links = [];
+    data.groups.forEach((g) => {
+      g.member_ids.forEach((pid) => {
+        if (!byId[pid]) return;
+        const line = document.createElementNS(SVG_NS, "line");
+        line.setAttribute("class", "cedge");
+        svg.appendChild(line);
+        links.push({ source: byId[pid], target: byId[g.id], el: line, strength: 0.16 });
+      });
+    });
+
+    const groups = nodes.filter((n) => n.kind === "group");
+    const radius = 170 + groups.length * 9;
+    groups.forEach((n, i) => {
+      const a = (i / Math.max(groups.length, 1)) * Math.PI * 2 - Math.PI / 2;
+      n.x = Math.cos(a) * radius;
+      n.y = Math.sin(a) * radius;
+    });
+    nodes.filter((n) => n.kind === "person").forEach((n) => {
+      const gs = n.data.group_ids.map((id) => byId[id]).filter(Boolean);
+      const len = gs.length || 1;
+      n.x = gs.reduce((s, g) => s + g.x, 0) / len + (Math.random() - 0.5) * 28;
+      n.y = gs.reduce((s, g) => s + g.y, 0) / len + (Math.random() - 0.5) * 28;
+    });
+
+    function place() {
+      nodes.forEach((n) => {
+        n.el.style.transform = "translate(" + n.x + "px, " + n.y + "px) translate(-50%, -50%)";
+      });
+      links.forEach((link) => {
+        link.el.setAttribute("x1", link.source.x + OFFSET);
+        link.el.setAttribute("y1", link.source.y + OFFSET);
+        link.el.setAttribute("x2", link.target.x + OFFSET);
+        link.el.setAttribute("y2", link.target.y + OFFSET);
+      });
+    }
+
+    function tick() {
+      for (let i = 0; i < links.length; i++) {
+        const link = links[i];
+        const s = link.source, t = link.target;
+        const dx = t.x - s.x, dy = t.y - s.y;
+        const dist = Math.hypot(dx, dy) || 1;
+        const rest = s.r + t.r + 32;
+        const k = ((dist - rest) / dist) * link.strength * alpha;
+        const mx = dx * k, my = dy * k;
+        s.vx += mx / s.mass;
+        s.vy += my / s.mass;
+        t.vx -= mx / t.mass;
+        t.vy -= my / t.mass;
+      }
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i], b = nodes[j];
+          let dx = b.x - a.x, dy = b.y - a.y;
+          let dist2 = dx * dx + dy * dy;
+          if (dist2 < 0.25) {
+            dx = (Math.random() - 0.5) * 0.5;
+            dy = (Math.random() - 0.5) * 0.5;
+            dist2 = dx * dx + dy * dy;
+          }
+          const dist = Math.sqrt(dist2);
+          const charge = a.kind === "group" && b.kind === "group" ? -520 : -140;
+          const force = (charge * alpha) / dist2;
+          const fx = (dx / dist) * force;
+          const fy = (dy / dist) * force;
+          a.vx += fx / a.mass;
+          a.vy += fy / a.mass;
+          b.vx -= fx / b.mass;
+          b.vy -= fy / b.mass;
+        }
+      }
+      for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        n.vx -= n.x * 0.006 * alpha;
+        n.vy -= n.y * 0.006 * alpha;
+        if (n.fx != null) {
+          n.x = n.fx;
+          n.y = n.fy;
+          n.vx = 0;
+          n.vy = 0;
+          continue;
+        }
+        n.vx *= 0.7;
+        n.vy *= 0.7;
+        n.x += n.vx;
+        n.y += n.vy;
+      }
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i], b = nodes[j];
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const dist = Math.hypot(dx, dy) || 0.01;
+          const min = a.r + b.r + 8;
+          if (dist >= min) continue;
+          const push = (min - dist) / dist * 0.5;
+          const ox = dx * push, oy = dy * push;
+          if (a.fx == null) { a.x -= ox; a.y -= oy; }
+          if (b.fx == null) { b.x += ox; b.y += oy; }
+        }
+      }
+    }
+
+    function heat(value) {
+      alpha = Math.max(alpha, value);
+      if (!running) {
+        running = true;
+        loop();
+      }
+    }
+
+    function loop() {
+      tick();
+      place();
+      alpha *= 0.92;
+      if (alpha < 0.02) {
+        running = false;
+        alpha = 0;
+        if (!userMoved) fit(true);
+        return;
+      }
+      requestAnimationFrame(loop);
+    }
+
+    function neighborhood(id) {
+      const n = byId[id];
+      const hot = new Set([id]);
+      if (!n) return hot;
+      if (n.kind === "person") {
+        n.data.group_ids.forEach((gid) => {
+          hot.add(gid);
+          (byId[gid] && byId[gid].data.member_ids || []).forEach((pid) => hot.add(pid));
+        });
+      } else {
+        n.data.member_ids.forEach((pid) => hot.add(pid));
+      }
+      return hot;
+    }
+
+    function connectedCount(person) {
+      const ids = new Set();
+      person.group_ids.forEach((gid) => {
+        (byId[gid] && byId[gid].data.member_ids || []).forEach((pid) => {
+          if (pid !== person.id) ids.add(pid);
+        });
+      });
+      return ids.size;
+    }
+
+    function deselect() {
+      selected = null;
+      world.classList.remove("is-focus");
+      nodes.forEach((n) => n.el.classList.remove("is-on", "is-near"));
+      links.forEach((link) => link.el.classList.remove("is-hot"));
+      sheet.classList.remove("is-open");
+    }
+
+    function fillSheet(n) {
+      sheet.replaceChildren();
+      const head = document.createElement("div");
+      head.className = "csheet-head";
+      const copy = document.createElement("div");
+      const name = document.createElement("div");
+      name.className = "csheet-name";
+      name.textContent = n.data.name;
+      const sub = document.createElement("div");
+      sub.className = "csheet-sub";
+      copy.append(name, sub);
+      if (n.kind === "person") {
+        head.append(makeAvatar(n.data), copy);
+        const groupsN = n.data.group_ids.length;
+        const others = connectedCount(n.data);
+        sub.textContent =
+          "In " + groupsN + (groupsN === 1 ? " group chat" : " group chats") +
+          " · connects " + others + (others === 1 ? " person" : " people");
+        const chips = document.createElement("div");
+        chips.className = "csheet-chips";
+        n.data.group_ids.forEach((gid) => {
+          const g = byId[gid];
+          if (!g) return;
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "csheet-chip";
+          btn.textContent = g.data.name;
+          btn.addEventListener("click", () => select(gid, true));
+          chips.appendChild(btn);
+        });
+        sheet.append(head, chips);
+        if (n.data.chat_id) {
+          const open = document.createElement("a");
+          open.className = "btn btn-primary csheet-open";
+          open.href = "/chat/" + n.data.chat_id;
+          open.textContent = "Open chat";
+          sheet.appendChild(open);
+        }
+      } else {
+        head.appendChild(copy);
+        const members = n.data.member_ids.length;
+        sub.textContent =
+          members + (members === 1 ? " person" : " people") +
+          " · " + n.data.messages.toLocaleString() + " messages";
+        const faces = document.createElement("div");
+        faces.className = "csheet-people";
+        n.data.member_ids.forEach((pid) => {
+          const p = byId[pid];
+          if (!p) return;
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "csheet-face";
+          btn.setAttribute("aria-label", p.data.name);
+          btn.title = p.data.name;
+          btn.appendChild(makeAvatar(p.data));
+          btn.addEventListener("click", () => select(pid, true));
+          faces.appendChild(btn);
+        });
+        sheet.append(head, faces);
+        if (n.data.chat_id) {
+          const open = document.createElement("a");
+          open.className = "btn btn-primary csheet-open";
+          open.href = "/chat/" + n.data.chat_id;
+          open.textContent = "Open group";
+          sheet.appendChild(open);
+        }
+      }
+      sheet.classList.add("is-open");
+    }
+
+    function select(id, move) {
+      const n = byId[id];
+      if (!n) return;
+      selected = id;
+      const hot = neighborhood(id);
+      world.classList.add("is-focus");
+      nodes.forEach((node) => {
+        node.el.classList.toggle("is-on", node.id === id);
+        node.el.classList.toggle("is-near", hot.has(node.id) && node.id !== id);
+      });
+      links.forEach((link) => {
+        link.el.classList.toggle("is-hot", hot.has(link.source.id) && hot.has(link.target.id));
+      });
+      fillSheet(n);
+      if (move) panTo(n);
+    }
+
+    viewport.addEventListener("pointerdown", (e) => {
+      const nodeEl = e.target.closest(".cnode");
+      viewport.setPointerCapture(e.pointerId);
+      if (nodeEl) {
+        const n = byId[nodeEl.dataset.id];
+        if (!n) return;
+        const w = toWorld(e.clientX, e.clientY);
+        drag = { id: n.id, dx: n.x - w.x, dy: n.y - w.y, moved: false, pointerId: e.pointerId };
+        select(n.id, false);
+        return;
+      }
+      drag = { pan: true, x: e.clientX, y: e.clientY, moved: false, pointerId: e.pointerId };
+      viewport.classList.add("is-panning");
+    });
+
+    viewport.addEventListener("pointermove", (e) => {
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      if (drag.pan) {
+        const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+        if (Math.hypot(dx, dy) > 3) drag.moved = true;
+        if (drag.moved) {
+          userMoved = true;
+          cam.x += dx;
+          cam.y += dy;
+          drag.x = e.clientX;
+          drag.y = e.clientY;
+          world.classList.remove("is-gliding");
+          applyCam();
+        }
+        return;
+      }
+      const n = byId[drag.id];
+      if (!n) return;
+      const w = toWorld(e.clientX, e.clientY);
+      const nx = w.x + drag.dx, ny = w.y + drag.dy;
+      if (Math.hypot(nx - n.x, ny - n.y) > 2) drag.moved = true;
+      if (!drag.moved) return;
+      userMoved = true;
+      n.fx = nx;
+      n.fy = ny;
+      heat(0.35);
+    });
+
+    function endDrag(e) {
+      if (!drag || (e && drag.pointerId !== e.pointerId)) return;
+      if (drag.pan && !drag.moved) deselect();
+      if (!drag.pan) {
+        const n = byId[drag.id];
+        if (n) { n.fx = null; n.fy = null; }
+        if (drag.moved) heat(0.25);
+      }
+      drag = null;
+      viewport.classList.remove("is-panning");
+    }
+
+    viewport.addEventListener("pointerup", endDrag);
+    viewport.addEventListener("pointercancel", endDrag);
+
+    viewport.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      userMoved = true;
+      world.classList.remove("is-gliding");
+      const rect = viewport.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const wx = (mx - cam.x) / cam.k;
+      const wy = (my - cam.y) / cam.k;
+      const next = Math.min(2.6, Math.max(0.3, cam.k * (e.deltaY < 0 ? 1.08 : 1 / 1.08)));
+      cam.k = next;
+      cam.x = mx - wx * cam.k;
+      cam.y = my - wy * cam.k;
+      applyCam();
+    }, { passive: false });
+
+    if (find) {
+      find.addEventListener("input", () => {
+        const q = find.value.trim().toLowerCase();
+        if (!q) return;
+        const match = nodes.find((n) => n.data.name.toLowerCase().includes(q));
+        if (match) select(match.id, true);
+      });
+      find.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          find.value = "";
+          find.blur();
+        }
+      });
+    }
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && selected && document.activeElement !== find) deselect();
+    });
+
+    window.addEventListener("resize", () => {
+      if (!userMoved) fit(false);
+    });
+
+    const rect = viewport.getBoundingClientRect();
+    cam.x = rect.width / 2;
+    cam.y = rect.height / 2;
+    cam.k = 0.85;
+    applyCam();
+    place();
+    if (reduceMotion) {
+      for (let i = 0; i < 220; i++) {
+        alpha = 0.08;
+        tick();
+      }
+      alpha = 0;
+      place();
+      fit(false);
+    } else {
+      heat(1);
+    }
   }
 
   function initTwinActivity() {
@@ -1226,5 +1984,6 @@
   initLightbox();
   initTapbacks();
   initTwin();
+  initCircles();
   initTwinActivity();
 })();

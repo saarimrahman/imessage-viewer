@@ -288,31 +288,33 @@ def model_config(model_key):
         raise ValueError(f"Unknown model: {model_key}") from e
 
 
-def adapter_dir(model_key):
-    return os.path.join(TWIN_DIR, "adapters", model_key)
+def adapter_dir(model_key, person_id="me"):
+    if not person_id or person_id == "me":
+        return os.path.join(TWIN_DIR, "adapters", model_key)
+    return os.path.join(TWIN_DIR, "people", person_id, "adapters", model_key)
 
 
 # Existing callers/tests imported ADAPTER before model selection existed.
 ADAPTER = adapter_dir("compact")
 
 
-def has_adapter(model_key="compact", adapter=None):
-    path = adapter or adapter_dir(model_key)
+def has_adapter(model_key="compact", adapter=None, person_id="me"):
+    path = adapter or adapter_dir(model_key, person_id)
     current = os.path.isfile(os.path.join(path, "adapters.safetensors"))
     if adapter is not None:
         return current
     # Recognize the adapter produced by the first Twin implementation.
-    if model_key == "compact" and not current:
+    if (not person_id or person_id == "me") and model_key == "compact" and not current:
         legacy = os.path.join(TWIN_DIR, "adapters", "adapters.safetensors")
         return os.path.isfile(legacy)
     return current
 
 
-def resolved_adapter_dir(model_key):
-    path = adapter_dir(model_key)
+def resolved_adapter_dir(model_key, person_id="me"):
+    path = adapter_dir(model_key, person_id)
     if has_adapter(model_key, path):
         return path
-    if model_key == "compact":
+    if (not person_id or person_id == "me") and model_key == "compact":
         legacy = os.path.join(TWIN_DIR, "adapters")
         if os.path.isfile(os.path.join(legacy, "adapters.safetensors")):
             return legacy
@@ -443,7 +445,18 @@ def main():
     )
     parser.add_argument("--data", default=TWIN_DIR)
     parser.add_argument("--adapter")
+    parser.add_argument(
+        "--person",
+        default="me",
+        help="me, or a phone number / email / person id from the Twin page",
+    )
     args = parser.parse_args()
+    from twin.export import parse_person_arg
+
+    try:
+        person_id = parse_person_arg(args.person)
+    except ValueError as e:
+        sys.exit(str(e))
     config = model_config(args.model_key)
     iters = args.iters
     if args.complete:
@@ -460,7 +473,7 @@ def main():
             iters=iters,
             model=config["repo"],
             data=args.data,
-            adapter=args.adapter or adapter_dir(args.model_key),
+            adapter=args.adapter or adapter_dir(args.model_key, person_id),
             batch_size=config["batch_size"],
             num_layers=config["layers"],
         )

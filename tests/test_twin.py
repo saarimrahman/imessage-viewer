@@ -1,9 +1,23 @@
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from twin.export import OPENER_PROMPT, collapse_turns, examples_from_turns, write_dataset
+from twin.export import (
+    ME,
+    OPENER_PROMPT,
+    SYSTEM,
+    collapse_turns,
+    examples_from_turns,
+    is_assistant_row,
+    opener_for,
+    parse_person_arg,
+    person_id_for,
+    resolve_subject,
+    system_for,
+    write_dataset,
+)
 from twin.job import (
     BUSY_PHASES,
     DOWNLOAD_RE,
@@ -17,7 +31,7 @@ from twin.job import (
     stop_train,
     chat as twin_chat,
 )
-from twin.train import DEFAULT_MODEL, MODELS, steps_for_examples, train_command
+from twin.train import DEFAULT_MODEL, MODELS, adapter_dir, steps_for_examples, train_command
 from render import NAV, render_twin
 
 
@@ -119,6 +133,56 @@ class ExamplesFromTurnsTest(unittest.TestCase):
         self.assertEqual([m["content"] for m in rows[-1]["messages"][-2:]], ["want food", "yeah"])
 
 
+class TwinPersonTest(unittest.TestCase):
+    def test_you_is_the_default_subject(self):
+        self.assertEqual(parse_person_arg(None), ME)
+        self.assertEqual(parse_person_arg("me"), ME)
+        self.assertEqual(resolve_subject(ME)["name"], "You")
+        self.assertEqual(person_id_for("me"), ME)
+
+    def test_phone_formats_collapse_to_the_same_person(self):
+        self.assertEqual(person_id_for("5555550100"), person_id_for("+1 (555) 555-0100"))
+        self.assertEqual(len(person_id_for("5555550100")), 16)
+        self.assertNotEqual(person_id_for("5555550100"), ME)
+
+    def test_hex_person_id_is_accepted(self):
+        self.assertEqual(parse_person_arg("aabbccddeeff0011"), "aabbccddeeff0011")
+
+    def test_unknown_handle_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_person_arg("not-a-contact")
+
+    def test_assistant_rows_flip_when_training_a_contact(self):
+        handle = "+15555550100"
+        key = __import__("contacts").person_key(handle)
+        self.assertTrue(is_assistant_row({"is_from_me": 1, "handle": None}))
+        self.assertFalse(is_assistant_row({"is_from_me": 0, "handle": handle}))
+        self.assertTrue(is_assistant_row({"is_from_me": 0, "handle": handle}, key))
+        self.assertFalse(is_assistant_row({"is_from_me": 1, "handle": None}, key))
+
+    def test_contact_prompt_stays_in_their_voice(self):
+        self.assertEqual(system_for("You"), SYSTEM)
+        self.assertIn("Alex", system_for("Alex"))
+        self.assertNotIn("I would", system_for("Alex"))
+        self.assertIn("Alex", opener_for("Alex"))
+        self.assertEqual(opener_for("You"), OPENER_PROMPT)
+
+    def test_contact_adapter_does_not_reuse_your_adapter_path(self):
+        yours = adapter_dir("qwen3-capable")
+        theirs = adapter_dir("qwen3-capable", "aabbccddeeff0011")
+        self.assertTrue(yours.endswith("adapters/qwen3-capable"))
+        self.assertIn("/people/aabbccddeeff0011/", theirs)
+        self.assertNotEqual(yours, theirs)
+
+    def test_opener_override_reaches_examples(self):
+        rows = examples_from_turns(
+            [{"role": "assistant", "content": "omw"}],
+            system="sys",
+            opener="text as Alex",
+        )
+        self.assertEqual(rows[0]["messages"][1], {"role": "user", "content": "text as Alex"})
+
+
 class DatasetWriterTest(unittest.TestCase):
     def test_every_example_remains_in_training_when_reference_is_created(self):
         examples = [
@@ -157,9 +221,10 @@ class TwinJobTest(unittest.TestCase):
         for key in (
             "phase", "detail", "iter", "iters", "examples", "busy", "has_adapter",
             "mlx", "metrics", "models", "eta_seconds", "elapsed_seconds",
-            "phase_seconds", "step_seconds", "runs",
+            "phase_seconds", "step_seconds", "runs", "person", "person_name",
         ):
             self.assertIn(key, s)
+        self.assertEqual(s["person"], "me")
         self.assertIsInstance(s["busy"], bool)
         self.assertIsInstance(s["has_adapter"], bool)
         self.assertIsInstance(s["mlx"], bool)
@@ -179,10 +244,41 @@ class TwinJobTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("run", err)
 
+    def test_rejects_an_unknown_person_without_starting(self):
+        ok, err = start_train(person_id="not-a-contact")
+        self.assertFalse(ok)
+        self.assertIn("contact", err.lower())
+
     def test_stop_does_nothing_when_idle(self):
-        ok, err = stop_train()
+        import twin.job as job
+
+        with patch.object(job, "_runs", []):
+            ok, err = stop_train()
         self.assertFalse(ok)
         self.assertIn("not training", err)
+
+    def test_stop_clears_a_stale_running_row(self):
+        import twin.job as job
+
+        stale = {"status": "running", "name": "Qwen 2.5 Compact", "started_at": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "runs.json")
+            with patch.object(job, "RUNS_PATH", path), patch.object(job, "_runs", [stale]):
+                ok, err = stop_train()
+                self.assertTrue(ok)
+                self.assertEqual(err, "")
+                self.assertEqual(job._runs[0]["status"], "cancelled")
+
+    def test_snapshot_marks_orphaned_runs_stopped(self):
+        import twin.job as job
+
+        stale = {"status": "running", "name": "Qwen 2.5 Compact", "started_at": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "runs.json")
+            with patch.object(job, "RUNS_PATH", path), patch.object(job, "_runs", [stale]):
+                s = snapshot()
+                self.assertEqual(s["runs"][0]["status"], "cancelled")
+                self.assertFalse(s["busy"])
 
     def test_chat_passes_the_model_template_args(self):
         tokenizer = MagicMock()
@@ -297,7 +393,71 @@ class TwinPageTest(unittest.TestCase):
         self.assertIn('class="twin-step-time"', html)
         self.assertIn('class="nav-dot"', html)
         self.assertIn('id="twinPanelChat"', html)
+        self.assertIn('id="twinWho"', html)
+        self.assertIn('id="twinWhoBtn"', html)
+        self.assertIn('id="twinWhoList"', html)
+        self.assertIn('data-person="me"', html)
+        self.assertIn('id="twinChatSelect"', html)
+        self.assertIn('id="twinChatPicker"', html)
+        self.assertIn('name="twinchat"', html)
         self.assertIn('href="#audit"', html)
         self.assertIn('data-tab="audit"', html)
         self.assertNotIn('id="twinPanelSignals"', html)
         self.assertNotIn('id="twinTabSignals"', html)
+
+    def test_chat_select_lists_only_trained_models(self):
+        models = [
+            {
+                "key": "qwen3-capable",
+                "name": "Qwen 3 Capable",
+                "params": "4B",
+                "download": "~2.3 GB",
+                "memory": "ok",
+                "description": "desc",
+                "publisher": "Alibaba",
+                "category": "Best overall",
+                "recommended": True,
+                "has_adapter": True,
+                "cached": True,
+            },
+            {
+                "key": "qwen3-compact",
+                "name": "Qwen 3 Compact UNIQUE",
+                "params": "0.6B",
+                "download": "~350 MB",
+                "memory": "ok",
+                "description": "desc",
+                "publisher": "Alibaba",
+                "category": "Efficient alternatives",
+                "recommended": False,
+                "has_adapter": False,
+                "cached": False,
+            },
+        ]
+        fake = {
+            "phase": "ready",
+            "detail": "",
+            "iter": 0,
+            "iters": 0,
+            "examples": 0,
+            "busy": False,
+            "has_adapter": True,
+            "mlx": True,
+            "metrics": [],
+            "models": models,
+            "model": "qwen3-capable",
+            "eta_seconds": None,
+            "elapsed_seconds": 12,
+            "phase_seconds": {},
+            "step_seconds": [0, 0, 0],
+            "runs": [],
+        }
+        with patch("twin.job.snapshot", return_value=fake):
+            html = render_twin()
+        start = html.index('id="twinChatSelect"')
+        chat_html = html[start:html.index("</select>", start)]
+        self.assertIn("qwen3-capable", chat_html)
+        self.assertIn("Qwen 3 Capable", chat_html)
+        self.assertNotIn("qwen3-compact", chat_html)
+        self.assertNotIn("Qwen 3 Compact UNIQUE", chat_html)
+        self.assertNotIn('id="twinChatPicker" hidden', html)

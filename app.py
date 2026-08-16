@@ -60,12 +60,14 @@ from render import (
     render_search,
     render_stats,
     render_twin,
+    render_circles,
     is_time_break,
 )
 from twin.job import (
     TwinError,
     chat as twin_chat,
     inspect_data as twin_inspect_data,
+    list_people as twin_list_people,
     snapshot as twin_snapshot,
     start_train,
     stop_train,
@@ -151,7 +153,11 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["twin", "train"]:
             run = body.get("run") or "complete"
             model = body.get("model") or "balanced"
-            ok, err = start_train(run=run, model_key=model)
+            ok, err = start_train(
+                run=run,
+                model_key=model,
+                person_id=body.get("person") or "me",
+            )
             if not ok:
                 self._send_json({"error": err, **twin_snapshot()}, status=409)
                 return
@@ -171,6 +177,7 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("text") or "",
                     history,
                     model_key=body.get("model") or "balanced",
+                    person_id=body.get("person") or "me",
                 )
             except TwinError as e:
                 self._send_json({"error": str(e)}, status=409)
@@ -194,13 +201,20 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_static(parts[1])
         elif parts[0] == "stats" and len(parts) == 1:
             self._send_html(render_stats())
+        elif parts[0] == "circles" and len(parts) == 1:
+            self._send_html(render_circles())
         elif parts[0] == "twin" and len(parts) == 1:
             self._send_html(render_twin())
         elif parts[0] == "twin" and len(parts) == 2 and parts[1] == "status":
             brief = qs.get("brief", [""])[0] in ("1", "true")
             self._send_json(twin_snapshot(brief=brief))
         elif parts[0] == "twin" and len(parts) == 2 and parts[1] == "data":
-            self._send_json(twin_inspect_data())
+            try:
+                self._send_json(twin_inspect_data(qs.get("person", ["me"])[0]))
+            except TwinError as e:
+                self._send_json({"error": str(e)}, status=400)
+        elif parts[0] == "twin" and len(parts) == 2 and parts[1] == "people":
+            self._send_json({"people": twin_list_people()})
         elif parts[0] == "search" and len(parts) == 1:
             query = qs.get("q", [None])[0]
             self._send_html(render_search(query))
@@ -464,11 +478,17 @@ def _stop(proc):
 
 def _watch_mtime():
     here = os.path.dirname(os.path.abspath(__file__))
-    return tuple(
-        _file_mtime(os.path.join(here, name))
-        for name in sorted(os.listdir(here))
-        if name.endswith(".py")
-    )
+    roots = [here, os.path.join(here, "twin")]
+    files = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        files.extend(
+            os.path.join(root, name)
+            for name in sorted(os.listdir(root))
+            if name.endswith(".py")
+        )
+    return tuple(_file_mtime(path) for path in files)
 
 
 def reloader():

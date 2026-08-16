@@ -32,6 +32,7 @@ from db import (
     load_reactions,
     message_text,
 )
+from graph import load_circle_graph
 from search import (
     index_error,
     is_index_ready,
@@ -133,6 +134,7 @@ NAV = (
     ("/media", "Photos", "photos"),
     ("/search", "Search", "search"),
     ("/stats", "Stats", "stats"),
+    ("/circles", "Circles", "circles"),
     ("/twin", "Twin", "twin"),
 )
 
@@ -1967,6 +1969,47 @@ Sorted by the month they held the largest share, so the list reads top to bottom
     return page("Stats", body, active="stats")
 
 
+def json_script(element_id, obj):
+    payload = json.dumps(obj, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+    return f'<script type="application/json" id="{html.escape(element_id)}">{payload}</script>'
+
+
+def render_circles():
+    conn = get_conn()
+    data = load_circle_graph(conn)
+    conn.close()
+    n_people = len(data["people"])
+    n_groups = len(data["groups"])
+    if not n_groups:
+        body = """<main class="circles-page" id="circlesPage">
+<div class="circles-empty">
+<h1>Circles</h1>
+<p>Group chats will show up here. Right now every conversation is one-to-one, so there is no overlap to draw.</p>
+</div>
+</main>"""
+        return page("Circles", body, active="circles", body_class="circlespage")
+
+    people_word = "person" if n_people == 1 else "people"
+    group_word = "group chat" if n_groups == 1 else "group chats"
+    solo = data["solo"]
+    solo_bit = f" · {solo:,} more only in one-to-one threads" if solo else ""
+    body = f"""<main class="circles-page" id="circlesPage">
+{json_script("circlesData", data)}
+<div class="circles-hud">
+<input class="search-input" id="circlesFind" type="search" placeholder="Find someone…" autocomplete="off" aria-label="Find someone">
+<p class="circles-meta" id="circlesMeta">{n_groups:,} {group_word} · {n_people:,} {people_word}{html.escape(solo_bit)}</p>
+</div>
+<div class="circles-viewport" id="circlesViewport">
+<div class="circles-world" id="circlesWorld">
+<svg class="circles-edges" id="circlesEdges" viewBox="0 0 4000 4000" width="4000" height="4000" aria-hidden="true"></svg>
+<div class="circles-nodes" id="circlesNodes"></div>
+</div>
+</div>
+<aside class="circles-sheet" id="circlesSheet" aria-live="polite"></aside>
+</main>"""
+    return page("Circles", body, active="circles", body_class="circlespage")
+
+
 def render_twin():
     from twin.job import snapshot
 
@@ -1978,8 +2021,14 @@ def render_twin():
         (m for m in s["models"] if m["key"] == selected_model),
         s["models"][0],
     )
-    selected_ready = selected_info["has_adapter"]
-    send_dis = " disabled" if (not selected_ready or s["busy"]) else ""
+    trained_models = [m for m in s["models"] if m["has_adapter"]]
+    chat_selected = next(
+        (m for m in trained_models if m["key"] == selected_model),
+        trained_models[0] if trained_models else None,
+    )
+    send_dis = " disabled" if (not chat_selected or s["busy"]) else ""
+    chat_select_dis = " disabled" if (s["busy"] or not chat_selected) else ""
+    chat_picker_hidden = "" if chat_selected else " hidden"
     model_groups = {}
     for model in s["models"]:
         suffix = " · trained" if model["has_adapter"] else ""
@@ -1993,6 +2042,14 @@ def render_twin():
     model_options = "".join(
         f'<optgroup label="{html.escape(category)}">{"".join(options)}</optgroup>'
         for category, options in model_groups.items()
+    )
+    chat_options = "".join(
+        (
+            f'<option value="{html.escape(model["key"])}"'
+            f'{" selected" if chat_selected and model["key"] == chat_selected["key"] else ""}>'
+            f'{html.escape(model["name"])} · {html.escape(model["params"])}</option>'
+        )
+        for model in trained_models
     )
     model_badges = "".join(
         (
@@ -2025,7 +2082,7 @@ def render_twin():
         )
     if s["busy"] or s["phase"] in ("error", "cancelled"):
         default_tab = "model"
-    elif selected_ready:
+    elif trained_models:
         default_tab = "chat"
     else:
         default_tab = "audit"
@@ -2041,11 +2098,25 @@ def render_twin():
 
     return page(
         "Twin",
-        f"""<main class="page twin-page{busy_cls}" id="twinPage" data-tab="{default_tab}">
+        f"""<main class="page twin-page{busy_cls}" id="twinPage" data-tab="{default_tab}" data-person="me">
 <header class="twin-hero">
 <div class="twin-hero-copy">
+<div class="twin-hero-who">
 <h1 class="twin-title">Twin</h1>
-<p class="twin-lede">Fine-tune a private local model on the way you actually text. Your messages and adapter never leave this Mac.</p>
+<div class="twin-who" id="twinWho">
+<p class="twin-eyebrow" id="twinWhoLabel">Train as</p>
+<button type="button" class="twin-who-btn" id="twinWhoBtn" aria-haspopup="listbox" aria-expanded="false" aria-controls="twinWhoMenu">
+<span class="twin-who-avatar" id="twinWhoAvatar">{avatar_html("You")}</span>
+<span class="twin-who-name" id="twinWhoName">You</span>
+<span class="twin-who-caret" aria-hidden="true">⌄</span>
+</button>
+<div class="twin-who-menu" id="twinWhoMenu" hidden>
+<input class="twin-who-search field" id="twinWhoSearch" type="search" placeholder="Search contacts" autocomplete="off" aria-label="Search contacts">
+<ul class="twin-who-list" id="twinWhoList" role="listbox" aria-labelledby="twinWhoLabel"></ul>
+</div>
+</div>
+</div>
+<p class="twin-lede" id="twinLede">Fine-tune a private local model on the way you actually text. Messages and adapters never leave this Mac.</p>
 </div>
 <div class="twin-tabs" id="twinTabs" role="tablist" aria-label="Twin">
 <a class="twin-tab" role="tab" id="twinTabAudit" href="#audit" data-tab="audit" aria-controls="twinPanelAudit" {tab_state("audit")}>Audit</a>
@@ -2067,7 +2138,7 @@ def render_twin():
 <div><strong data-stat="group_chats">—</strong><span>group chats</span></div>
 <div><strong data-stat="attachments_only">—</strong><span>media-only, skipped</span></div>
 </div>
-<p class="twin-data-copy">Every non-empty text you sent becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately.</p>
+<p class="twin-data-copy" id="twinDataCopy">Every non-empty text you sent becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately.</p>
 </div>
 </section>
 
@@ -2141,7 +2212,10 @@ def render_twin():
 <section class="twin-panel twin-panel-chat" id="twinPanelChat" role="tabpanel" data-tab="chat" aria-labelledby="twinChatTitle"{panel_hidden("chat")}>
 <div class="twin-chat-head">
 <div><h2 id="twinChatTitle">Text your twin</h2></div>
-<p class="twin-section-note" id="twinChatModel">Select a trained model in Model.</p>
+<div class="twin-select-wrap twin-chat-select-wrap" id="twinChatPicker"{chat_picker_hidden}>
+<select class="twin-model-select twin-chat-select" id="twinChatSelect" name="twinchat" aria-label="Trained model"{chat_select_dis}>{chat_options}</select>
+<span class="twin-select-arrow" aria-hidden="true">⌄</span>
+</div>
 </div>
 <div class="twin-thread" id="twinThread"></div>
 <form class="twin-compose" id="twinCompose">
