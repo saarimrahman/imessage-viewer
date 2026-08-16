@@ -1,20 +1,22 @@
 # iMessage Viewer
 
-Fast local viewer for your messages on your Mac. Scroll chats, search them, look at photos, and read stats on how you text.
+A fast, private way to explore your messages on your Mac. Browse conversations, search chats, view photos, and discover insights about how you text.
 
 Nothing ever leaves your Mac. There is no cloud, no account, and no telemetry. All messages stay on your machine. Completely private.
 
-Reads `~/Library/Messages/chat.db` and Contacts. Writes indexes to `.cache/` (not in git).
+The app reads your Messages database (`~/Library/Messages/chat.db`) and Contacts, and stores local indexes in `.cache/` (excluded from Git).
 
-## Full Disk Access
+### Allow Access to Messages
 
-macOS blocks Messages until you grant Full Disk Access to the app that runs this server.
+macOS requires **Full Disk Access** to read Messages.
 
-1. Open System Settings → Privacy & Security → Full Disk Access.
-2. Turn on Terminal, iTerm, or Cursor (the app you use to run `python3 app.py`).
-3. Quit that app with Command-Q, then open it again.
+1. Open the setting directly:
+   ```bash
+   open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+   ```
+2. Enable the app running `python3 app.py`—such as **Terminal**, **iTerm**, or **Cursor**.
 
-Without this, every page shows old data or no data.
+Without this permission, pages may show outdated or missing data.
 
 ## Run
 
