@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -285,6 +286,9 @@ MODEL = MODELS["compact"]["repo"]  # Backwards-compatible public constant.
 ADAPTER_WEIGHTS = "adapters.safetensors"
 LEGACY_RUN = "legacy"
 MAX_ITERS = 1_000_000
+EARLY_STOP_PATIENCE = 6
+EARLY_STOP_MIN_DELTA = 0.01
+EARLY_STOP_MIN_EVALS = 3
 CHECKPOINT_RE = re.compile(r"^(\d{7})_adapters\.safetensors$")
 
 
@@ -566,6 +570,44 @@ def save_every_for(iters):
     return max(50, iters // 20)
 
 
+def note_reference_eval(
+    tracker,
+    loss,
+    iteration,
+    min_delta=EARLY_STOP_MIN_DELTA,
+    patience=EARLY_STOP_PATIENCE,
+    min_evals=EARLY_STOP_MIN_EVALS,
+):
+    """Update reference-loss early-stop state. Lower loss is better."""
+    tracker["evals"] = int(tracker.get("evals") or 0) + 1
+    best = tracker.get("best")
+    if best is None or loss <= best - min_delta:
+        tracker["best"] = loss
+        tracker["best_iter"] = iteration
+        tracker["stale"] = 0
+        return False
+    tracker["stale"] = int(tracker.get("stale") or 0) + 1
+    return tracker["evals"] >= min_evals and tracker["stale"] >= patience
+
+
+def restore_best_checkpoint(path, best_iter):
+    """Copy the best numbered save over adapters.safetensors. Return the source path."""
+    latest = os.path.join(path, ADAPTER_WEIGHTS)
+    if not best_iter:
+        return latest if os.path.isfile(latest) else None
+    numbered = os.path.join(path, f"{int(best_iter):07d}_{ADAPTER_WEIGHTS}")
+    src = numbered if os.path.isfile(numbered) else None
+    if src is None:
+        earlier = [step for step in checkpoint_steps(path) if step <= int(best_iter)]
+        if earlier:
+            src = os.path.join(path, f"{earlier[-1]:07d}_{ADAPTER_WEIGHTS}")
+    if src is None or not os.path.isfile(src):
+        return latest if os.path.isfile(latest) else None
+    if os.path.abspath(src) != os.path.abspath(latest):
+        shutil.copy2(src, latest)
+    return src
+
+
 def steps_for_examples(examples, batch_size):
     """One complete pass through the shuffled training rows."""
     return max(1, math.ceil(examples / max(1, batch_size)))
@@ -640,6 +682,7 @@ def run_train(
     max_seq_length=768,
     on_line=None,
     on_proc=None,
+    save_every=None,
     resume_adapter_file=None,
 ):
     train_path = os.path.join(data, "train.jsonl")
@@ -657,7 +700,7 @@ def run_train(
         max_seq_length=max_seq_length,
         steps_per_report=steps_per_report,
         steps_per_eval=steps_per_eval,
-        save_every=save_every_for(iters),
+        save_every=save_every if save_every is not None else save_every_for(iters),
         resume_adapter_file=resume_adapter_file,
     )
     env = os.environ.copy()

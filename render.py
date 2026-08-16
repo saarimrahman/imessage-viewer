@@ -2231,7 +2231,7 @@ def render_twin():
 <div class="twin-metrics" id="twinMetrics"{metrics_hidden}>
 <div class="twin-section-head">
 <div><h2 id="twinMetricsTitle">How the model is learning</h2></div>
-<p class="twin-section-note">Train and reference loss on a stable sample that stays in training, so every text contributes.</p>
+<p class="twin-section-note">Train and reference loss on a stable sample. Complete runs stop after reference loss stops improving and keep the best checkpoint.</p>
 </div>
 <div class="twin-chart-grid">
 <figure class="card card-pad twin-chart"><figcaption><strong>Loss</strong><span>Lower is better</span></figcaption><svg id="twinLossChart" viewBox="0 0 520 190" role="img" aria-label="Training and reference loss"><g class="chart-grid"></g><path class="chart-line chart-train"></path><path class="chart-line chart-reference"></path><g class="chart-labels"></g></svg><div class="twin-legend"><span class="is-train">Train</span><span class="is-reference">Reference</span></div></figure>

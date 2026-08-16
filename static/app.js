@@ -1134,7 +1134,8 @@
       list.replaceChildren();
       rows.forEach((raw) => {
         const row = liveRun(raw, live);
-        const status = row.status === "ready" ? "Done"
+        const status = row.status === "ready" && row.early_stopped ? "Plateau"
+          : row.status === "ready" ? "Done"
           : row.status === "cancelled" ? "Stopped"
             : row.status === "running" ? "Running"
               : "Failed";
@@ -1261,6 +1262,8 @@
         statusEl.textContent = s.detail || "Training failed.";
       } else if (s.phase === "cancelled") {
         statusEl.textContent = "Training stopped.";
+      } else if (modelReady && s.early_stopped) {
+        statusEl.textContent = model.name + " adapter ready. Reference loss plateaued; kept the best checkpoint.";
       } else if (modelReady) {
         statusEl.textContent = model.name + " adapter ready. Send a text or retrain it.";
       } else {
@@ -1275,6 +1278,7 @@
       else if (busy && s.elapsed_seconds) bits.push(formatDuration(s.elapsed_seconds));
       else if (busy) bits.push("Step " + (s.phase === "inspecting" ? 1 : s.phase === "exporting" ? 2 : 3) + " of 4");
       else if (s.phase === "cancelled") bits.push("Stopped");
+      else if (s.early_stopped) bits.push("Plateau");
       else if (modelReady) bits.push(s.elapsed_seconds ? formatDuration(s.elapsed_seconds) : "Ready");
       progressMetaEl.textContent = bits.join(" · ");
       const waiting = WAITING_PHASES.includes(s.phase);
@@ -1317,6 +1321,8 @@
         } else if (busy && s.examples) {
           const who = isYou(selectedPerson()) ? "sent texts" : "texts";
           hintEl.textContent = s.examples.toLocaleString() + " examples cover " + s.sent_texts.toLocaleString() + " " + who + " across " + s.chats.toLocaleString() + " chats" + (s.augmented ? ", including " + s.augmented.toLocaleString() + " short-context variants." : ".");
+        } else if (s.early_stopped) {
+          hintEl.textContent = "Reference loss stopped improving, so training ended. Chat uses the best checkpoint. Continue from it if you want more steps.";
         } else if (modelReady) {
           hintEl.textContent = "Each train writes a new adapter. Earlier checkpoints stay in the chat list.";
         } else {

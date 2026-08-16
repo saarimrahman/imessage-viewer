@@ -30,10 +30,12 @@ from twin.train import (
     list_adapter_runs,
     make_run_id,
     model_config,
+    note_reference_eval,
     parse_checkpoint_id,
     read_run_metadata,
     resolve_checkpoint,
     resolved_adapter_dir,
+    restore_best_checkpoint,
     run_train,
     steps_for_examples,
     write_run_metadata,
@@ -69,6 +71,7 @@ STEP_PHASES = (
 _lock = threading.Lock()
 _gen_lock = threading.Lock()
 _cancel = threading.Event()
+_early_stop = threading.Event()
 _proc = None
 _runs = None
 _model = None
@@ -90,6 +93,9 @@ _state = {
     "run_id": "",
     "data_hash": "",
     "resume_from": "",
+    "early_stopped": False,
+    "best_iter": 0,
+    "best_reference_loss": None,
     "metrics": [],
     "started_at": None,
     "phase_started_at": None,
@@ -104,6 +110,10 @@ class TwinError(Exception):
 
 
 class TwinCancelled(Exception):
+    pass
+
+
+class TwinEarlyStop(Exception):
     pass
 
 
@@ -251,6 +261,9 @@ def snapshot(brief=False):
             "run_id": _state.get("run_id") or "",
             "data_hash": _state.get("data_hash") or "",
             "resume_from": _state.get("resume_from") or "",
+            "early_stopped": bool(_state.get("early_stopped")),
+            "best_iter": _state.get("best_iter") or 0,
+            "best_reference_loss": _state.get("best_reference_loss"),
             "busy": phase in BUSY_PHASES,
             "has_adapter": has_adapter(model_key, person_id=person_id),
             "started_at": started_at,
@@ -335,6 +348,7 @@ def start_train(
         if _state["phase"] in BUSY_PHASES:
             return False, "already training"
         _cancel.clear()
+        _early_stop.clear()
         _state.update(
             phase="inspecting",
             detail="Auditing the complete message archive…",
@@ -351,6 +365,9 @@ def start_train(
             run_id="",
             data_hash="",
             resume_from=resume["id"] if resume else "",
+            early_stopped=False,
+            best_iter=0,
+            best_reference_loss=None,
             metrics=[],
             started_at=now,
             phase_started_at=now,
@@ -526,7 +543,13 @@ def _complete_run(status):
                 "data_hash": _state.get("data_hash") or "",
                 "resume_from": _state.get("resume_from") or "",
                 "train_loss": train_loss,
-                "reference_loss": reference_loss,
+                "reference_loss": (
+                    _state.get("best_reference_loss")
+                    if _state.get("best_reference_loss") is not None
+                    else reference_loss
+                ),
+                "early_stopped": bool(_state.get("early_stopped")),
+                "best_iter": _state.get("best_iter") or 0,
                 "detail": _state.get("detail") or "",
             }
         )
@@ -542,6 +565,9 @@ def _train_worker(run, model_key, subject, custom_iters=None, resume=None):
 
 def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=None):
     target_adapter = None
+    metadata = {}
+    tracker = {}
+    iters = 0
     try:
         if _cancel.is_set():
             raise TwinCancelled()
@@ -616,6 +642,8 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
         _set(phase=load_phase, detail=load_detail)
 
         saw_iter = False
+        tracker = {}
+        steps_per_eval = max(1, iters // 12)
 
         def on_line(line):
             nonlocal saw_iter
@@ -624,13 +652,32 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
             metric = parse_metric(line)
             if metric:
                 _append_metric(metric)
+                if (
+                    not is_quick
+                    and "reference_loss" in metric
+                    and note_reference_eval(tracker, metric["reference_loss"], metric["iter"])
+                    and not _early_stop.is_set()
+                ):
+                    _early_stop.set()
+                    _set(
+                        best_iter=tracker.get("best_iter") or 0,
+                        best_reference_loss=tracker.get("best"),
+                        detail="Reference loss plateaued. Keeping the best checkpoint…",
+                    )
+                    _kill_proc(_proc)
             n = parse_iter(line)
             if n is not None:
                 saw_iter = True
                 _set(
                     phase="training",
                     iter=n,
-                    detail=f"Training {n:,}/{iters:,} steps",
+                    detail=(
+                        "Reference loss plateaued. Keeping the best checkpoint…"
+                        if _early_stop.is_set()
+                        else f"Training {n:,}/{iters:,} steps"
+                    ),
+                    best_iter=tracker.get("best_iter") or 0,
+                    best_reference_loss=tracker.get("best"),
                 )
             elif saw_iter:
                 return
@@ -655,18 +702,28 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
                 num_layers=config["layers"],
                 on_line=on_line,
                 on_proc=_remember_proc,
+                save_every=None if is_quick else steps_per_eval,
                 resume_adapter_file=resume["weights"] if resume else None,
             )
         except RuntimeError:
             if _cancel.is_set():
                 raise TwinCancelled() from None
+            if _early_stop.is_set():
+                raise TwinEarlyStop() from None
             raise
         if _cancel.is_set():
             raise TwinCancelled()
-        metadata["status"] = "ready"
-        write_run_metadata(target_adapter, metadata)
-        _set(phase="ready", detail="Adapter ready.", iter=iters)
-        _complete_run("ready")
+        if _early_stop.is_set():
+            raise TwinEarlyStop()
+        _finish_ready(target_adapter, metadata, tracker, early=False, iters=iters)
+    except TwinEarlyStop:
+        if target_adapter and has_weights(target_adapter):
+            _finish_ready(target_adapter, metadata, tracker, early=True, iters=iters)
+        else:
+            if target_adapter:
+                shutil.rmtree(target_adapter, ignore_errors=True)
+            _set(phase="cancelled", detail="Stopped before a checkpoint was saved.")
+            _complete_run("cancelled")
     except TwinCancelled:
         if target_adapter and has_weights(target_adapter):
             meta = {
@@ -690,6 +747,37 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
         _complete_run("error")
     finally:
         _remember_proc(None)
+
+
+def _finish_ready(target_adapter, metadata, tracker, early, iters):
+    best_iter = int(tracker.get("best_iter") or 0)
+    best_loss = tracker.get("best")
+    if target_adapter and best_iter:
+        restore_best_checkpoint(target_adapter, best_iter)
+    meta = {**(read_run_metadata(target_adapter) if target_adapter else {}), **(metadata or {})}
+    meta.update(
+        status="ready",
+        early_stopped=bool(early),
+        best_iter=best_iter,
+        best_reference_loss=best_loss,
+    )
+    if target_adapter:
+        write_run_metadata(target_adapter, meta)
+    ready = {
+        "phase": "ready",
+        "detail": (
+            "Reference loss plateaued. Kept the best checkpoint."
+            if early
+            else "Adapter ready."
+        ),
+        "early_stopped": bool(early),
+        "best_iter": best_iter,
+        "best_reference_loss": best_loss,
+    }
+    if not early:
+        ready["iter"] = iters
+    _set(**ready)
+    _complete_run("ready")
 
 
 def _load_model(model_key, person_id=ME, run_id=None, step="latest"):

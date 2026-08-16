@@ -40,7 +40,9 @@ from twin.train import (
     has_adapter,
     list_adapter_runs,
     make_run_id,
+    note_reference_eval,
     parse_checkpoint_id,
+    restore_best_checkpoint,
     save_every_for,
     steps_for_examples,
     train_command,
@@ -236,7 +238,7 @@ class TwinJobTest(unittest.TestCase):
             "phase", "detail", "iter", "iters", "examples", "busy", "has_adapter",
             "mlx", "metrics", "models", "eta_seconds", "elapsed_seconds",
             "phase_seconds", "step_seconds", "runs", "person", "person_name",
-            "adapter_runs", "run_id", "data_hash",
+            "adapter_runs", "run_id", "data_hash", "early_stopped",
         ):
             self.assertIn(key, s)
         self.assertEqual(s["person"], "me")
@@ -245,6 +247,7 @@ class TwinJobTest(unittest.TestCase):
         self.assertIsInstance(s["mlx"], bool)
         self.assertIsInstance(s["runs"], list)
         self.assertIsInstance(s["adapter_runs"], list)
+        self.assertIn("early_stopped", s)
         self.assertEqual(len(s["step_seconds"]), 3)
 
     def test_brief_snapshot_skips_heavy_fields(self):
@@ -403,6 +406,38 @@ class TwinModelTest(unittest.TestCase):
     def test_long_runs_save_periodic_checkpoints(self):
         self.assertEqual(save_every_for(30), 30)
         self.assertEqual(save_every_for(20000), 1000)
+
+    def test_reference_plateau_stops_after_patience(self):
+        tracker = {}
+        self.assertFalse(note_reference_eval(tracker, 2.0, 1, patience=3, min_evals=3))
+        self.assertFalse(note_reference_eval(tracker, 1.5, 10, patience=3, min_evals=3))
+        self.assertFalse(note_reference_eval(tracker, 1.495, 20, patience=3, min_evals=3))
+        self.assertFalse(note_reference_eval(tracker, 1.50, 30, patience=3, min_evals=3))
+        self.assertTrue(note_reference_eval(tracker, 1.51, 40, patience=3, min_evals=3))
+        self.assertEqual(tracker["best_iter"], 10)
+        self.assertEqual(tracker["best"], 1.5)
+
+    def test_tiny_reference_drops_do_not_reset_patience(self):
+        tracker = {}
+        note_reference_eval(tracker, 1.50, 10, min_delta=0.01, patience=2, min_evals=2)
+        note_reference_eval(tracker, 1.495, 20, min_delta=0.01, patience=2, min_evals=2)
+        self.assertTrue(note_reference_eval(tracker, 1.494, 30, min_delta=0.01, patience=2, min_evals=2))
+        self.assertEqual(tracker["best_iter"], 10)
+
+    def test_restore_best_checkpoint_copies_the_winning_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            latest = os.path.join(tmp, "adapters.safetensors")
+            best = os.path.join(tmp, "0000100_adapters.safetensors")
+            later = os.path.join(tmp, "0000200_adapters.safetensors")
+            with open(best, "w", encoding="utf-8") as f:
+                f.write("best")
+            with open(later, "w", encoding="utf-8") as f:
+                f.write("later")
+            with open(latest, "w", encoding="utf-8") as f:
+                f.write("later")
+            restore_best_checkpoint(tmp, 100)
+            with open(latest, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "best")
 
 
 class TwinAdapterRunTest(unittest.TestCase):

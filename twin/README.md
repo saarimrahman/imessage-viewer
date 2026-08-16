@@ -44,7 +44,7 @@ Quick uses 160 recent examples and 30 steps. Use this run to make sure that loca
 
 Complete builds the full dataset. Then it makes one pass through all generated examples unless you set a step count.
 
-Each train writes a new adapter folder named with the start time, a hash of `train.jsonl`, and the step count. Earlier adapters stay on disk. Long runs save checkpoints about every 5% of the step count. Stop mid-run and you can chat with the last save, or continue from it.
+Each train writes a new adapter folder named with the start time, a hash of `train.jsonl`, and the step count. Earlier adapters stay on disk. Complete runs save a checkpoint at each reference evaluation. Training ends after six evaluations with no meaningful drop in reference loss, and the best checkpoint is kept. Stop mid-run and you can still chat with the last save, or continue from it.
 
 The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. The Model tab can start from fresh weights or from a saved checkpoint.
 
