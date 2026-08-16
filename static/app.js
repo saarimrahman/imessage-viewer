@@ -600,6 +600,7 @@
     const form = document.getElementById("twinCompose");
     const chatPicker = document.getElementById("twinChatPicker");
     const chatSelect = document.getElementById("twinChatSelect");
+    const newChatBtn = document.getElementById("twinNewChat");
     const TABS = ["audit", "model", "chat"];
     const tabButtons = Array.from(page.querySelectorAll(".twin-tab"));
     const panels = Array.from(page.querySelectorAll(".twin-panel"));
@@ -747,9 +748,7 @@
       applyPersonCopy(person);
       closeWho();
       if (fromUser && changed) {
-        history.length = 0;
-        thread.replaceChildren();
-        emptyState();
+        resetChat();
         loadDataProfile();
         if (lastStatus) applyStatus(lastStatus);
       }
@@ -856,14 +855,31 @@
       return d.innerHTML;
     }
 
+    function syncNewChat() {
+      if (!newChatBtn) return;
+      newChatBtn.disabled = sending || !thread.querySelector(".row");
+    }
+
+    function resetChat() {
+      history.length = 0;
+      thread.replaceChildren();
+      emptyState();
+    }
+
     function emptyState() {
-      if (thread.querySelector(".row")) return;
+      if (thread.querySelector(".row")) {
+        syncNewChat();
+        return;
+      }
       const person = selectedPerson();
       const you = isYou(person);
       const trained = !!(chatPicker && !chatPicker.hidden && chatSelect.options.length);
       const key = String(trained) + ":" + (person.id || "me");
       const existing = thread.querySelector(".twin-empty");
-      if (existing && existing.dataset.key === key) return;
+      if (existing && existing.dataset.key === key) {
+        syncNewChat();
+        return;
+      }
       if (existing) existing.remove();
       const p = document.createElement("p");
       p.className = "twin-empty";
@@ -882,6 +898,7 @@
         p.append(a);
       }
       thread.appendChild(p);
+      syncNewChat();
     }
 
     function addBubble(who, text, pending) {
@@ -899,6 +916,7 @@
       row.innerHTML = '<div class="bubble tail">' + esc(text) + "</div>";
       thread.appendChild(row);
       row.scrollIntoView({ block: "end", behavior: reduceMotion ? "auto" : "smooth" });
+      syncNewChat();
       return row;
     }
 
@@ -1299,8 +1317,7 @@
         if (person && s.model && person.trained && person.trained.indexOf(s.model) < 0) {
           person.trained.push(s.model);
         }
-        history.length = 0;
-        thread.replaceChildren();
+        resetChat();
         showTab("chat", true);
         setHash("chat");
         loadPeople();
@@ -1431,11 +1448,17 @@
     });
 
     chatSelect.addEventListener("change", () => {
-      history.length = 0;
-      thread.replaceChildren();
-      emptyState();
+      resetChat();
       if (lastStatus) applyStatus(lastStatus);
     });
+
+    if (newChatBtn) {
+      newChatBtn.addEventListener("click", () => {
+        if (sending || !thread.querySelector(".row")) return;
+        resetChat();
+        if (input && !input.disabled) input.focus();
+      });
+    }
 
     if (whoBtn) {
       whoBtn.addEventListener("click", (e) => {
@@ -1474,6 +1497,7 @@
       addBubble("me", text);
       const pending = addBubble("them", "…", true);
       sendBtn.disabled = true;
+      syncNewChat();
       try {
         const res = await fetch("/twin/chat", {
           method: "POST",
@@ -1494,6 +1518,7 @@
         pending.querySelector(".bubble").textContent = "The twin could not reply.";
       }
       sending = false;
+      syncNewChat();
       await refreshStatus();
     });
 

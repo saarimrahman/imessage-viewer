@@ -2267,9 +2267,12 @@ def render_twin():
 <section class="twin-panel twin-panel-chat" id="twinPanelChat" role="tabpanel" data-tab="chat" aria-labelledby="twinChatTitle"{panel_hidden("chat")}>
 <div class="twin-chat-head">
 <div><h2 id="twinChatTitle">Text your twin</h2></div>
+<div class="twin-chat-tools">
 <div class="twin-select-wrap twin-chat-select-wrap" id="twinChatPicker"{chat_picker_hidden}>
 <select class="twin-model-select twin-chat-select" id="twinChatSelect" name="twinchat" aria-label="Trained checkpoint"{chat_select_dis}>{chat_options}</select>
 <span class="twin-select-arrow" aria-hidden="true">⌄</span>
+</div>
+<button type="button" class="btn btn-ghost twin-new-chat" id="twinNewChat" disabled>New chat</button>
 </div>
 </div>
 <div class="twin-thread" id="twinThread"></div>

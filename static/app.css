@@ -2720,10 +2720,22 @@ body.twinpage { background: var(--bg-chat); }
   padding: 0 2px 8px;
 }
 
+.twin-chat-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .twin-chat-select-wrap {
   flex: 0 1 240px;
   min-width: 168px;
   max-width: 280px;
+}
+
+.twin-new-chat {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .twin-chat-select {
@@ -3247,7 +3259,8 @@ body.circlespage {
   .twin-run-actions { margin-left: 0; }
   .twin-chart-grid { grid-template-columns: 1fr; }
   .twin-chat-head { align-items: stretch; flex-direction: column; gap: 8px; }
-  .twin-chat-select-wrap { flex: 1 1 auto; min-width: 0; max-width: none; width: 100%; }
+  .twin-chat-tools { width: 100%; }
+  .twin-chat-select-wrap { flex: 1 1 auto; min-width: 0; max-width: none; width: auto; }
   .twin-thread .row { max-width: 86%; }
 
   .circles-hud { top: 10px; gap: 8px; flex-wrap: wrap; }

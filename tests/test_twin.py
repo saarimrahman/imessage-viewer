@@ -554,6 +554,7 @@ class TwinPageTest(unittest.TestCase):
         self.assertIn('data-person="me"', html)
         self.assertIn('id="twinChatSelect"', html)
         self.assertIn('id="twinChatPicker"', html)
+        self.assertIn('id="twinNewChat"', html)
         self.assertIn('name="twinchat"', html)
         self.assertIn('id="twinIters"', html)
         self.assertIn('id="twinResume"', html)
