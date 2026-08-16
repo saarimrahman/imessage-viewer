@@ -9,18 +9,22 @@ from twin.export import (
     CONTEXT_TURNS,
     ME,
     OPENER_PROMPT,
+    REPETITION_PENALTY,
     SYSTEM,
     cap_duplicate_targets,
     clip_bubbles,
     coerce_chat,
     collapse_turns,
+    contains_redaction,
     downsample_recency,
     examples_from_turns,
     fit_messages,
+    inject_train_shots,
     is_alternating,
     is_artifact,
     is_assistant_row,
     is_low_signal,
+    is_redaction_only,
     opener_for,
     parse_person_arg,
     partition_examples,
@@ -28,11 +32,20 @@ from twin.export import (
     redact_text,
     resolve_subject,
     sessionize,
+    split_bubbles,
     system_for,
     write_dataset,
 )
-from twin.eval import chr_f, ranking_score, recipient_summary, rouge_l, score_reply
-from twin.retrieve import retrieve
+from twin.eval import (
+    RANK_EXAMPLES,
+    chr_f,
+    pick_ranked_checkpoint,
+    ranking_score,
+    recipient_summary,
+    rouge_l,
+    score_reply,
+)
+from twin.retrieve import index_from_examples, retrieve, with_retrieved_shots
 from twin.job import (
     BUSY_PHASES,
     DOWNLOAD_RE,
@@ -338,6 +351,80 @@ class SessionAndFitTest(unittest.TestCase):
         hits = retrieve("you free tonight", index, k=2, exclude=["you free"])
         self.assertEqual(hits[0]["query"], "you around later")
 
+    def test_retrieve_can_exclude_the_current_reply(self):
+        index = [
+            {"query": "you free later", "reply": "yeah 10", "tokens": ["you", "free", "later"]},
+            {"query": "you around", "reply": "maybe", "tokens": ["you", "around"]},
+        ]
+        hits = retrieve(
+            "you free tonight",
+            index,
+            k=2,
+            exclude_replies=["yeah 10"],
+        )
+        self.assertEqual(hits[0]["query"], "you around")
+
+    def test_retrieved_shots_share_the_context_budget(self):
+        live = []
+        for i in range(6):
+            live.append({"role": "user", "content": f"u{i} hello there"})
+            live.append({"role": "assistant", "content": f"a{i} sure"})
+        live.append({"role": "user", "content": "you free tonight"})
+        messages = [{"role": "system", "content": system_for("You", peer="Alex")}] + live
+        index = index_from_examples(
+            [
+                {"_query": "you free", "_reply": "yeah", "_peer": "Alex", "_date": 1},
+                {"_query": "you around", "_reply": "give me 10", "_peer": "Alex", "_date": 2},
+            ]
+        )
+        out = with_retrieved_shots(messages, index, k=2, peer="Alex")
+        non_sys = [m for m in out if m["role"] != "system"]
+        self.assertLessEqual(len(non_sys), CONTEXT_TURNS)
+        self.assertEqual(non_sys[0]["role"], "user")
+        self.assertEqual(non_sys[-1]["content"], "you free tonight")
+        self.assertTrue(any(m["content"] == "yeah" for m in non_sys))
+
+    def test_train_prompts_include_retrieved_shots(self):
+        def row(query, reply, date):
+            return {
+                "messages": [
+                    {"role": "system", "content": system_for("You", peer="Alex")},
+                    {"role": "user", "content": query},
+                    {"role": "assistant", "content": reply},
+                ],
+                "_query": query,
+                "_reply": reply,
+                "_peer": "Alex",
+                "_date": date,
+            }
+
+        examples = [
+            row("you free", "yeah", 1),
+            row("you free later", "maybe tonight", 2),
+            row("want food", "I could eat", 3),
+        ]
+        out, n = inject_train_shots(examples)
+        self.assertGreater(n, 0)
+        later = next(item for item in out if item["_query"] == "you free later")
+        contents = [m["content"] for m in later["messages"]]
+        self.assertIn("yeah", contents)
+        self.assertEqual(contents[-1], "maybe tonight")
+        self.assertNotEqual(contents[1], "you free later")
+
+    def test_noisy_ranking_gap_keeps_the_nll_checkpoint(self):
+        nll = [0.50 + (i % 5) * 0.01 for i in range(100)]
+        other = [x + 0.002 for x in nll]
+        self.assertEqual(pick_ranked_checkpoint({"latest": nll, 1200: other}), "latest")
+
+    def test_clear_ranking_gap_overrides_the_nll_checkpoint(self):
+        nll = [0.20] * 100
+        other = [0.80] * 100
+        self.assertEqual(pick_ranked_checkpoint({"latest": nll, 1200: other}), 1200)
+        self.assertGreaterEqual(RANK_EXAMPLES, 100)
+
+    def test_repetition_penalty_does_not_sand_off_tics(self):
+        self.assertLessEqual(REPETITION_PENALTY, 1.05)
+
     def test_holdout_metrics_prefer_close_replies(self):
         good = score_reply("yeah give me 10", "yeah give me 10")
         bland = score_reply("Of course! I would be happy to help you with that.", "yeah give me 10")
@@ -360,6 +447,14 @@ class SessionAndFitTest(unittest.TestCase):
         self.assertIn("[phone]", redact_text("call 555-123-4567"))
         self.assertEqual(redact_text("482193"), "[code]")
         self.assertIn("[password]", redact_text("password: hunter2"))
+
+    def test_placeholder_targets_are_dropped(self):
+        self.assertTrue(contains_redaction("my number is [phone]"))
+        self.assertTrue(contains_redaction("see you at [address]"))
+        self.assertTrue(contains_redaction("[phone]"))
+        self.assertFalse(contains_redaction("ok sounds good"))
+        self.assertTrue(is_redaction_only("[phone]"))
+        self.assertFalse(is_redaction_only("my number is [phone]"))
 
     def test_duplicate_and_short_targets_are_capped(self):
         def row(reply, date, idx):
@@ -394,6 +489,8 @@ class SessionAndFitTest(unittest.TestCase):
         clipped = clip_bubbles(loop)
         self.assertEqual(clipped.count(BUBBLE), 3)
         self.assertEqual(clip_bubbles("just one"), "just one")
+        self.assertEqual(split_bubbles("yeah<|bubble|>wait 20"), ["yeah", "wait 20"])
+        self.assertEqual(len(BUBBLE), 1)
 
     def test_eos_rate_and_recipient_collapse_are_scored(self):
         ok = score_reply("yeah give me 10", "yeah give me 10", hit_limit=False)

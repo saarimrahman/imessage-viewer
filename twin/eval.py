@@ -24,14 +24,13 @@ from twin.export import (
     BUBBLE,
     CHAT_TEMP,
     CHAT_TOP_P,
-    CONTEXT_TURNS,
     TWIN_DIR,
     clip_bubbles,
     peer_from_system,
     split_bubbles,
     system_for,
 )
-from twin.retrieve import RETRIEVE_K, few_shot_messages, load_index, retrieve
+from twin.retrieve import RETRIEVE_K, load_index, with_retrieved_shots
 from twin.train import (
     DEFAULT_MODEL,
     MODELS,
@@ -56,6 +55,10 @@ SEARCH_GRID = {
     "layers": [8, 16],
     "seeds": [0, 1],
 }
+RANK_EXAMPLES = 100
+RANK_BOOTSTRAP = 1000
+RANK_OVERRIDE_P = 0.95
+RANK_MIN_DELTA = 0.02
 
 
 def _ngrams(text, n):
@@ -168,13 +171,6 @@ def load_jsonl(path):
     return rows
 
 
-def last_user(messages):
-    for message in reversed(messages):
-        if message.get("role") == "user":
-            return message.get("content") or ""
-    return ""
-
-
 def gold_reply(messages):
     if messages and messages[-1].get("role") == "assistant":
         return messages[-1].get("content") or ""
@@ -185,32 +181,89 @@ def prompt_messages(example, retrieve_index=None, retrieve_k=0):
     body = [dict(m) for m in example.get("messages") or []]
     if body and body[-1].get("role") == "assistant":
         body = body[:-1]
-    if retrieve_index and retrieve_k:
-        query = last_user(body)
-        system_text = body[0].get("content") or "" if body and body[0].get("role") == "system" else ""
-        shots = retrieve(
-            query,
-            retrieve_index,
-            k=retrieve_k,
-            exclude=[query],
-            peer=peer_from_system(system_text),
-        )
-        if shots:
-            system = body[:1] if body and body[0].get("role") == "system" else []
-            rest = body[len(system) :]
-            body = system + few_shot_messages(shots) + rest
-    # Keep the live thread inside the shared context budget.
-    system = body[:1] if body and body[0].get("role") == "system" else []
-    rest = body[len(system) :]
-    rest = rest[-CONTEXT_TURNS:]
-    while rest and rest[0].get("role") != "user":
-        rest = rest[1:]
-    return system + rest
+    system_text = body[0].get("content") or "" if body and body[0].get("role") == "system" else ""
+    return with_retrieved_shots(
+        body,
+        retrieve_index or [],
+        k=retrieve_k,
+        peer=peer_from_system(system_text),
+    )
 
 
 def mean(values):
     values = list(values)
     return sum(values) / len(values) if values else 0.0
+
+
+def bootstrap_ci(values, n_boot=RANK_BOOTSTRAP, alpha=0.05, rng=None):
+    """Mean and percentile interval. Returns (mean, lo, hi)."""
+    values = list(values)
+    n = len(values)
+    avg = mean(values)
+    if n < 2:
+        return avg, avg, avg
+    rng = rng or random.Random(0)
+    samples = []
+    for _ in range(n_boot):
+        total = 0.0
+        for _i in range(n):
+            total += values[rng.randrange(n)]
+        samples.append(total / n)
+    samples.sort()
+    lo = samples[int((alpha / 2) * n_boot)]
+    hi = samples[min(n_boot - 1, int((1 - alpha / 2) * n_boot))]
+    return avg, lo, hi
+
+
+def paired_win_rate(challenger, baseline, n_boot=RANK_BOOTSTRAP, rng=None):
+    """Paired bootstrap P(mean(challenger) > mean(baseline))."""
+    n = min(len(challenger), len(baseline))
+    if n == 0:
+        return 0.0
+    rng = rng or random.Random(0)
+    wins = 0
+    ties = 0
+    for _ in range(n_boot):
+        total_a = 0.0
+        total_b = 0.0
+        for _i in range(n):
+            j = rng.randrange(n)
+            total_a += challenger[j]
+            total_b += baseline[j]
+        if total_a > total_b:
+            wins += 1
+        elif total_a == total_b:
+            ties += 1
+    return (wins + 0.5 * ties) / n_boot
+
+
+def pick_ranked_checkpoint(
+    scores_by_label,
+    nll_label="latest",
+    min_p=RANK_OVERRIDE_P,
+    min_delta=RANK_MIN_DELTA,
+    rng=None,
+):
+    """Keep the NLL checkpoint unless another is significantly better on ranking."""
+    if not scores_by_label:
+        return nll_label
+    if nll_label not in scores_by_label:
+        return max(scores_by_label.items(), key=lambda item: mean(item[1]))[0]
+    baseline = scores_by_label[nll_label]
+    base_mean = mean(baseline)
+    rng = rng or random.Random(0)
+    winners = []
+    for label, scores in scores_by_label.items():
+        if label == nll_label:
+            continue
+        if mean(scores) < base_mean + min_delta:
+            continue
+        if paired_win_rate(scores, baseline, rng=rng) >= min_p:
+            winners.append((mean(scores), label))
+    if not winners:
+        return nll_label
+    winners.sort(key=lambda item: (-item[0], str(item[1])))
+    return winners[0][1]
 
 
 def summarize(rows):
@@ -264,6 +317,8 @@ def recipient_summary(rows):
 
 def smoke_template(tokenizer, chat_template_args=None, name="You"):
     """Render one legal Twin example. Raise if the chat template rejects it."""
+    from twin.export import bubble_token_count
+
     messages = [
         {"role": "system", "content": system_for(name)},
         {"role": "user", "content": "you free"},
@@ -277,6 +332,11 @@ def smoke_template(tokenizer, chat_template_args=None, name="You"):
         **kwargs,
     )
     tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
+    pieces = bubble_token_count(tokenizer)
+    if pieces is not None and pieces >= 5:
+        raise RuntimeError(
+            f"{BUBBLE} tokenizes into {pieces} pieces; pick a shorter delimiter"
+        )
     return True
 
 
@@ -353,10 +413,11 @@ def score_checkpoints(
     data_dir,
     model_key,
     split="valid",
-    max_examples=24,
+    max_examples=RANK_EXAMPLES,
     person_name="You",
+    temp=0.0,
 ):
-    """Score the latest and numbered checkpoints; restore the generation winner."""
+    """Score numbered checkpoints against the NLL-best latest; restore only a clear win."""
     del person_name
     path = os.path.join(data_dir, f"{split}.jsonl")
     if not os.path.isfile(path):
@@ -364,6 +425,9 @@ def score_checkpoints(
     examples = load_jsonl(path)
     if not examples:
         return None
+    rng = random.Random(0)
+    if max_examples and len(examples) > max_examples:
+        examples = rng.sample(examples, max_examples)
     steps = checkpoint_steps(adapter_dir)
     latest = os.path.join(adapter_dir, "adapters.safetensors")
     candidates = []
@@ -382,25 +446,44 @@ def score_checkpoints(
             continue
         seen.add(dest)
         unique.append((label, dest))
-    best = None
     reports = []
+    scores_by_label = {}
     for label, dest in unique:
         (model, tokenizer), config = _load_mlx(model_key, dest)
-        summary, _ = evaluate_split(
+        summary, rows = evaluate_split(
             examples,
             model,
             tokenizer,
             chat_template_args=config.get("chat_template_args"),
-            max_examples=max_examples,
+            temp=temp,
         )
+        ranks = [ranking_score(row) for row in rows]
+        avg, lo, hi = bootstrap_ci(ranks, rng=random.Random(0))
         summary["checkpoint"] = label
+        summary["ranking"] = avg
+        summary["ranking_lo"] = lo
+        summary["ranking_hi"] = hi
         reports.append(summary)
-        score = summary.get("ranking") or 0
-        if best is None or score > best[0]:
-            best = (score, label, dest)
-    if best and best[1] != "latest" and isinstance(best[1], int):
-        restore_best_checkpoint(adapter_dir, best[1])
-    return {"best": best[1] if best else None, "reports": reports}
+        scores_by_label[label] = ranks
+    nll_label = "latest" if "latest" in scores_by_label else None
+    if nll_label:
+        nll_scores = scores_by_label[nll_label]
+        for summary, label in ((row, row["checkpoint"]) for row in reports):
+            if label == nll_label:
+                summary["p_better_than_nll"] = 0.5
+            else:
+                summary["p_better_than_nll"] = paired_win_rate(
+                    scores_by_label[label], nll_scores, rng=random.Random(0)
+                )
+    choice = pick_ranked_checkpoint(scores_by_label, nll_label=nll_label or "latest")
+    if choice != "latest" and isinstance(choice, int):
+        restore_best_checkpoint(adapter_dir, choice)
+    return {
+        "best": choice,
+        "overrode_nll": bool(nll_label) and choice != nll_label,
+        "n": len(examples),
+        "reports": reports,
+    }
 
 
 def print_grid():
@@ -417,7 +500,7 @@ def main():
     parser.add_argument("--data", default=TWIN_DIR)
     parser.add_argument("--adapter", help="Adapter directory to load")
     parser.add_argument("--split", choices=("valid", "test"), default="valid")
-    parser.add_argument("--max-examples", type=int, default=64)
+    parser.add_argument("--max-examples", type=int, default=RANK_EXAMPLES)
     parser.add_argument("--retrieve", action="store_true")
     parser.add_argument("--base", action="store_true", help="Score the base model without an adapter")
     parser.add_argument("--temp", type=float, default=0.0)

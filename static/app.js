@@ -904,7 +904,7 @@
     }
 
     function addBubbles(who, text, pendingRow) {
-      const parts = String(text || "").split("<|bubble|>").map((part) => part.trim()).filter(Boolean);
+      const parts = String(text || "").split(/※|<\|bubble\|>/).map((part) => part.trim()).filter(Boolean);
       if (!parts.length) {
         if (pendingRow) {
           pendingRow.querySelector(".bubble").textContent = "";

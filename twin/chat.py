@@ -11,9 +11,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from twin.export import (
+    BUBBLE,
     CHAT_TEMP,
     CHAT_TOP_P,
-    CONTEXT_TURNS,
     MAX_BUBBLES,
     REPETITION_PENALTY,
     TWIN_DIR,
@@ -23,7 +23,7 @@ from twin.export import (
     resolve_subject,
     system_for,
 )
-from twin.retrieve import RETRIEVE_K, few_shot_messages, load_index, retrieve
+from twin.retrieve import RETRIEVE_K, load_index, with_retrieved_shots
 from twin.train import DEFAULT_MODEL, MODELS, model_config, resolved_adapter_dir
 
 
@@ -41,7 +41,7 @@ def load_model(model, adapter):
 
 
 def generate_kwargs(max_tokens, temp=CHAT_TEMP, top_p=CHAT_TOP_P, seed=0):
-    """Sampler and repetition penalty for Twin decoding."""
+    """Sampler for Twin decoding. The bubble cap stops delimiter loops."""
     kwargs = {"max_tokens": max_tokens}
     if temp and temp > 0:
         from mlx_lm.sample_utils import make_sampler
@@ -49,11 +49,12 @@ def generate_kwargs(max_tokens, temp=CHAT_TEMP, top_p=CHAT_TOP_P, seed=0):
 
         mx.random.seed(seed)
         kwargs["sampler"] = make_sampler(temp, top_p=top_p)
-    from mlx_lm.sample_utils import make_logits_processors
+    if REPETITION_PENALTY and abs(REPETITION_PENALTY - 1.0) > 1e-6:
+        from mlx_lm.sample_utils import make_logits_processors
 
-    processors = make_logits_processors(repetition_penalty=REPETITION_PENALTY)
-    if processors:
-        kwargs["logits_processors"] = processors
+        processors = make_logits_processors(repetition_penalty=REPETITION_PENALTY)
+        if processors:
+            kwargs["logits_processors"] = processors
     return kwargs
 
 
@@ -81,18 +82,14 @@ def complete(
 
 
 def _with_retrieval(messages, text, enabled, peer=None):
-    if not enabled:
-        return messages
-    shots = few_shot_messages(
-        retrieve(text, load_index(TWIN_DIR), k=RETRIEVE_K, exclude=[text], peer=peer)
+    index = load_index(TWIN_DIR) if enabled else []
+    return with_retrieved_shots(
+        messages,
+        index,
+        k=RETRIEVE_K if enabled else 0,
+        exclude=[text],
+        peer=peer,
     )
-    if not shots:
-        return messages
-    system = messages[:1] if messages and messages[0]["role"] == "system" else []
-    rest = messages[len(system) :]
-    budget = max(2, CONTEXT_TURNS - len(shots))
-    rest = rest[-budget:]
-    return system + shots + rest
 
 
 def main():
@@ -182,7 +179,7 @@ def main():
                 top_p=args.top_p,
             )
             messages.append({"role": "assistant", "content": reply})
-            print("twin:", reply.replace("<|bubble|>", " / "))
+            print("twin:", reply.replace(BUBBLE, " / ").replace("<|bubble|>", " / "))
     except (KeyboardInterrupt, EOFError):
         print()
 

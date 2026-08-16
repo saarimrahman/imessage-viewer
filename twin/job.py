@@ -801,7 +801,7 @@ def _finish_ready(target_adapter, metadata, tracker, early, iters):
     scored = None
     if target_adapter and (metadata or {}).get("run") == "complete" and not _cancel.is_set():
         try:
-            from twin.eval import score_checkpoints
+            from twin.eval import RANK_EXAMPLES, score_checkpoints
 
             _set(detail="Scoring holdout replies…")
             scored = score_checkpoints(
@@ -809,7 +809,7 @@ def _finish_ready(target_adapter, metadata, tracker, early, iters):
                 TWIN_DIR,
                 metadata.get("model") or DEFAULT_MODEL,
                 split="valid",
-                max_examples=24,
+                max_examples=RANK_EXAMPLES,
                 person_name=metadata.get("person_name") or "You",
             )
         except Exception:
@@ -902,15 +902,9 @@ def chat(
         from mlx_lm import generate
         from twin.chat import generate_kwargs
 
-        messages = [{"role": "system", "content": system_for(subject["name"], peer=to)}]
-        shots = []
-        if retrieve_pairs:
-            from twin.retrieve import RETRIEVE_K, few_shot_messages, load_index, retrieve
+        from twin.retrieve import RETRIEVE_K, load_index, with_retrieved_shots
 
-            pairs = retrieve(
-                text, load_index(TWIN_DIR), k=RETRIEVE_K, exclude=[text], peer=to
-            )
-            shots = few_shot_messages(pairs)
+        messages = [{"role": "system", "content": system_for(subject["name"], peer=to)}]
         live = []
         if history:
             for turn in history:
@@ -919,9 +913,14 @@ def chat(
                 if role in ("user", "assistant") and content:
                     live.append({"role": role, "content": content})
         live.append({"role": "user", "content": text})
-        budget = max(2, HISTORY_TURNS - len(shots))
-        live = live[-budget:]
-        messages = coerce_chat(messages + shots + live)
+        messages = with_retrieved_shots(
+            messages + live,
+            load_index(TWIN_DIR) if retrieve_pairs else [],
+            k=RETRIEVE_K if retrieve_pairs else 0,
+            exclude=[text],
+            peer=to,
+        )
+        messages = coerce_chat(messages)
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,

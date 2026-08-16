@@ -8,15 +8,15 @@ Your messages and adapters stay on this Mac. The app stores the generated datase
 
 Complete trains on direct 1:1 chats only. Group chats are counted on the Audit tab and left out of the adapter, because several senders would otherwise share one anonymous `user` role.
 
-The exporter splits each chat into sessions at a 12-hour gap. Consecutive bubbles from the same person stay together with a `<|bubble|>` delimiter. A 30-minute gap starts a new bubble group. Training windows do not cross sessions.
+The exporter splits each chat into sessions at a 12-hour gap. Consecutive bubbles from the same person stay together with a `※` delimiter. A 30-minute gap starts a new bubble group. Training windows do not cross sessions.
 
-Each authentic reply with incoming context becomes one example. Conversation starters with no incoming message in that session are not mixed into reply training. Tapback summaries, unsent notices, media-only turns, and link-only replies are dropped. Secrets in the remaining text are replaced with placeholders before training.
+Each authentic reply with incoming context becomes one example. Conversation starters with no incoming message in that session are not mixed into reply training. Tapback summaries, unsent notices, media-only turns, link-only replies, and replies that still contain a redaction placeholder after scrubbing are dropped. Secrets in the remaining context are replaced with placeholders before training. Training prompts include the same retrieved incoming/reply pairs that chat injects, so the adapter learns to use them.
 
 Short acknowledgments such as "ok" or "lol" are capped so they cannot dominate the target distribution. Exact duplicate replies are limited. Older train sessions are kept with decaying probability so recent style has more weight. Later sessions are held out 80/10/10 by session, so `valid.jsonl` and `test.jsonl` are not copies of training.
 
 Each example is trimmed from the oldest context so the full target reply always fits `max_seq_length`. Examples whose target cannot fit are dropped.
 
-Training and chat use the same system prompt, the same 10-turn context budget, and the same chat-template kwargs. The system prompt names the other person in a 1:1 chat so the twin can switch register. Chat samples at temperature 0.5 with a bubble cap and a repetition penalty. Pass `--to` so live chat matches that recipient conditioning.
+Training and chat use the same system prompt, the same 10-turn context budget, and the same chat-template kwargs. The system prompt names the other person in a 1:1 chat so the twin can switch register. Chat samples at temperature 0.5 with a bubble cap. Pass `--to` so live chat matches that recipient conditioning.
 
 Media-only messages do not contain text for the model. The Audit section counts these messages separately.
 
@@ -50,11 +50,11 @@ Open <http://127.0.0.1:8765/twin>.
 
 Quick uses 160 recent examples and 30 steps. Use this run only to make sure that local training works.
 
-Complete builds sessionized 1:1 pairs, holds out later sessions, and trains about three epochs with learning rate `1e-5`, warmup plus cosine decay, and gradient accumulation toward an effective batch of 8. It evaluates the real holdout during training, keeps the best checkpoint, then scores a sample of holdout generations.
+Complete builds sessionized 1:1 pairs, holds out later sessions, and trains about three epochs with learning rate `1e-5`, warmup plus cosine decay, and gradient accumulation toward an effective batch of 8. It evaluates the real holdout during training, keeps the best NLL checkpoint, then scores about 100 holdout generations. A ranking winner replaces that checkpoint only when a paired bootstrap says the gap is real.
 
 Each train writes a new adapter folder named with the start time, a hash of `train.jsonl`, and the step count. Earlier adapters stay on disk. Stop mid-run and you can still chat with the last save, or continue from it.
 
-The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. Chat also retrieves two similar train-set incoming/reply pairs when `retrieve.jsonl` exists. Retrieval prefers recent pairs and, when `--to` is set, pairs with the same recipient.
+The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. Chat also retrieves two similar train-set incoming/reply pairs when `retrieve.jsonl` exists. Training examples include those shots, so the adapter has seen that prompt shape. Retrieval prefers recent pairs and, when `--to` is set, pairs with the same recipient.
 
 The charts show training loss, holdout loss, throughput, and peak memory.
 

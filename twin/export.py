@@ -4,6 +4,9 @@
 Direct 1:1 chats are split into sessions, then each authentic reply becomes one
 training example. Consecutive bubbles stay separate with a delimiter. Later
 sessions are held out so validation measures generalization, not memorization.
+Replies that still contain a redaction placeholder are dropped so the twin
+does not learn to emit tokens such as ``[phone]``. Training prompts include
+retrieved incoming/reply pairs so they match chat.
 """
 
 import argparse
@@ -25,7 +28,9 @@ from contacts import person_key, resolve_contact
 from db import MSG_SELECT, REACTION_EXCLUDE_SQL, get_conn, message_text
 
 ME = "me"
-BUBBLE = "<|bubble|>"
+# One token on the offered bases. `<|bubble|>` split into 5–6 pieces.
+BUBBLE = "※"
+BUBBLE_ALIASES = (BUBBLE, "<|bubble|>")
 CONTEXT_TURNS = 10
 MAX_SEQ_LENGTH = 768
 SESSION_GAP_NS = 12 * 60 * 60 * 1_000_000_000
@@ -47,7 +52,7 @@ RECENCY_FLOOR = 0.15
 CHAT_TEMP = 0.5
 CHAT_TOP_P = 0.9
 MAX_BUBBLES = 4
-REPETITION_PENALTY = 1.15
+REPETITION_PENALTY = 1.0
 TWIN_DIR = os.path.join(CACHE_DIR, "twin")
 LOW_SIGNAL = {
     "ok", "k", "kk", "okay", "ok.", "okay.",
@@ -89,8 +94,11 @@ ADDR_RE = re.compile(
 )
 CODE_MSG_RE = re.compile(r"^\d{4,8}$")
 URL_ONLY_RE = re.compile(r"(?i)^https?://\S+$")
+REDACTION_TOKEN_RE = re.compile(r"\[(?:phone|email|code|password|card|address)\]")
 REDACTION_ONLY_RE = re.compile(
-    r"^(?:\[(?:phone|email|code|password|card|address)\](?:\s*<\|bubble\|>\s*)?)+$"
+    r"^(?:\[(?:phone|email|code|password|card|address)\](?:\s*"
+    + re.escape(BUBBLE)
+    + r"\s*)?)+$"
 )
 _TWIN_SELECT_SQL = None
 
@@ -146,7 +154,11 @@ def join_bubbles(parts):
 
 
 def split_bubbles(text):
-    return [part.strip() for part in str(text or "").split(BUBBLE) if part.strip()]
+    text = str(text or "")
+    for alias in BUBBLE_ALIASES:
+        if alias != BUBBLE:
+            text = text.replace(alias, BUBBLE)
+    return [part.strip() for part in text.split(BUBBLE) if part.strip()]
 
 
 def clip_bubbles(text, max_bubbles=MAX_BUBBLES):
@@ -222,9 +234,30 @@ def redact_messages(messages):
     return out
 
 
+def contains_redaction(text):
+    """True when any redaction placeholder remains in the text."""
+    return bool(REDACTION_TOKEN_RE.search(text or ""))
+
+
 def is_redaction_only(text):
     compact = (text or "").strip()
     return (not compact.replace(BUBBLE, "").strip()) or bool(REDACTION_ONLY_RE.match(compact))
+
+
+def bubble_token_count(tokenizer):
+    """How many tokenizer pieces ``BUBBLE`` becomes. None if it cannot be counted."""
+    if tokenizer is None or not hasattr(tokenizer, "encode"):
+        return None
+    try:
+        ids = tokenizer.encode(BUBBLE, add_special_tokens=False)
+    except TypeError:
+        ids = tokenizer.encode(BUBBLE)
+    if isinstance(ids, dict):
+        ids = ids.get("input_ids") or []
+    try:
+        return len(ids)
+    except TypeError:
+        return None
 
 
 def recency_weight(date_ns, now_ns, half_life=RECENCY_HALF_LIFE_NS):
@@ -638,6 +671,59 @@ def partition_examples(examples, train_frac=TRAIN_FRACTION, valid_frac=VALID_FRA
     return split
 
 
+def inject_train_shots(
+    examples,
+    tokenizer=None,
+    max_seq_length=MAX_SEQ_LENGTH,
+    chat_template_args=None,
+):
+    """Prepend retrieved train pairs so the adapter learns to use them.
+
+    ``retrieve.jsonl`` stays the original pairs. If shots cannot fit with the
+    full target, the example is left unchanged.
+    """
+    from twin.retrieve import RETRIEVE_K, index_from_examples, retrieve, with_retrieved_shots
+
+    if not examples:
+        return examples, 0
+    index = index_from_examples(examples)
+    out = []
+    injected = 0
+    for example in examples:
+        query = example.get("_query") or ""
+        reply = example.get("_reply") or ""
+        pairs = retrieve(
+            query,
+            index,
+            k=RETRIEVE_K,
+            exclude=[query],
+            exclude_replies=[reply],
+            peer=example.get("_peer") or None,
+        )
+        if not pairs:
+            out.append(example)
+            continue
+        candidate = with_retrieved_shots(example["messages"], pairs=pairs)
+        fitted = fit_messages(
+            candidate,
+            tokenizer,
+            max_seq_length=max_seq_length,
+            chat_template_args=chat_template_args,
+        )
+        if fitted is None or not is_alternating(fitted):
+            out.append(example)
+            continue
+        shot_query = pairs[0]["query"]
+        if not any(m.get("content") == shot_query for m in fitted):
+            out.append(example)
+            continue
+        row = dict(example)
+        row["messages"] = fitted
+        out.append(row)
+        injected += 1
+    return out, injected
+
+
 def public_example(example):
     return {"messages": example["messages"]}
 
@@ -831,7 +917,7 @@ def collect_examples(
                 row["messages"] = redact_messages(row["messages"])
                 row["_query"] = row["messages"][-2]["content"]
                 row["_reply"] = row["messages"][-1]["content"]
-                if is_redaction_only(row["_reply"]):
+                if contains_redaction(row["_reply"]):
                     skipped_pii += 1
                     continue
                 row["_peer"] = peer or ""
@@ -993,9 +1079,16 @@ def export_dataset(
     concentration = target_concentration(raw_train)
     split["train"], capped = cap_duplicate_targets(split["train"])
     split["train"], recency_dropped = downsample_recency(split["train"])
+    split["train"], train_with_shots = inject_train_shots(
+        split["train"],
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+        chat_template_args=chat_template_args,
+    )
     n_train, n_valid, n_test = write_dataset(
         examples, out_dir, train=split["train"], valid=split["valid"], test=split["test"]
     )
+    bubble_pieces = bubble_token_count(tokenizer)
     meta = {
         **stats,
         "train": n_train,
@@ -1010,6 +1103,8 @@ def export_dataset(
         "top20_share": concentration["top20_share"],
         "capped_targets": capped,
         "recency_dropped": recency_dropped,
+        "train_with_shots": train_with_shots,
+        "bubble_tokens": bubble_pieces,
     }
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "split.json"), "w", encoding="utf-8") as f:
