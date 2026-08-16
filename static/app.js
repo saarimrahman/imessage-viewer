@@ -592,6 +592,8 @@
     const metricsEl = document.getElementById("twinMetrics");
     const trainBtn = document.getElementById("twinTrain");
     const stopBtn = document.getElementById("twinStop");
+    const itersInput = document.getElementById("twinIters");
+    const resumeSelect = document.getElementById("twinResume");
     const sendBtn = document.getElementById("twinSend");
     const input = document.getElementById("twinInput");
     const thread = document.getElementById("twinThread");
@@ -751,6 +753,64 @@
         loadDataProfile();
         if (lastStatus) applyStatus(lastStatus);
       }
+    }
+
+    function adaptersForPerson(s) {
+      const person = selectedPerson();
+      if (s.adapter_runs && s.person === (person.id || "me")) return s.adapter_runs || [];
+      return (person && person.adapters) || [];
+    }
+
+    function runLabel(run) {
+      const bits = [run.name || run.model || "Model"];
+      if (run.params) bits.push(run.params);
+      const when = formatWhen(run.created_at);
+      if (when) bits.push(when);
+      if (run.iters) bits.push(run.iters.toLocaleString() + " steps");
+      if (run.data_hash) bits.push(run.data_hash.slice(0, 8));
+      return bits.join(" · ");
+    }
+
+    function checkpointLabel(ckpt) {
+      if (ckpt.step === "latest") {
+        return ckpt.step_n ? "Latest · " + Number(ckpt.step_n).toLocaleString() + " steps" : "Latest";
+      }
+      return "Step " + Number(ckpt.step_n || ckpt.step).toLocaleString();
+    }
+
+    function fillCheckpointSelect(select, runs, selectedId, includeFresh) {
+      const prev = selectedId == null ? select.value : selectedId;
+      select.replaceChildren();
+      if (includeFresh) {
+        const fresh = document.createElement("option");
+        fresh.value = "";
+        fresh.textContent = "Fresh weights";
+        select.appendChild(fresh);
+      }
+      runs.forEach((run) => {
+        const ckpts = run.checkpoints || [];
+        if (!ckpts.length) return;
+        if (ckpts.length === 1) {
+          const option = document.createElement("option");
+          option.value = ckpts[0].id;
+          option.textContent = runLabel(run);
+          select.appendChild(option);
+          return;
+        }
+        const group = document.createElement("optgroup");
+        group.label = runLabel(run);
+        ckpts.forEach((ckpt) => {
+          const option = document.createElement("option");
+          option.value = ckpt.id;
+          option.textContent = checkpointLabel(ckpt);
+          group.appendChild(option);
+        });
+        select.appendChild(group);
+      });
+      const values = Array.from(select.options).map((opt) => opt.value);
+      if (prev && values.indexOf(prev) >= 0) select.value = prev;
+      else if (includeFresh) select.value = "";
+      else if (values.length) select.value = values[0];
     }
 
     function chatModel() {
@@ -977,22 +1037,19 @@
       });
     }
 
-    function syncChatPicker(s) {
-      const trained = modelsForPerson(s).filter((model) => model.has_adapter);
-      const prev = chatSelect.value;
-      const preferred = trained.some((model) => model.key === prev)
-        ? prev
-        : (trained.some((model) => model.key === s.model) ? s.model : (trained[0] && trained[0].key) || "");
-      chatSelect.replaceChildren();
-      trained.forEach((model) => {
-        const option = document.createElement("option");
-        option.value = model.key;
-        option.textContent = model.name + " · " + model.params;
-        chatSelect.appendChild(option);
-      });
-      if (preferred) chatSelect.value = preferred;
-      chatPicker.hidden = trained.length === 0;
-      chatSelect.disabled = !!s.busy || trained.length === 0;
+    function syncChatPicker(s, preferId) {
+      const runs = adaptersForPerson(s);
+      fillCheckpointSelect(chatSelect, runs, preferId == null ? chatSelect.value : preferId, false);
+      chatPicker.hidden = runs.length === 0;
+      chatSelect.disabled = !!s.busy || runs.length === 0;
+    }
+
+    function syncResumePicker(s) {
+      if (!resumeSelect) return;
+      const model = selectedModel();
+      const runs = adaptersForPerson(s).filter((run) => run.model === model);
+      fillCheckpointSelect(resumeSelect, runs, resumeSelect.value, true);
+      resumeSelect.disabled = !!s.busy;
     }
 
     function updateModelSummary(model) {
@@ -1111,8 +1168,13 @@
         badge.textContent = status;
         sub.append(badge);
         const kindLabel = document.createElement("span");
-        kindLabel.textContent = row.run === "quick" ? "Quick" : "Complete";
+        kindLabel.textContent = row.run === "quick" ? "Quick" : row.run === "complete" ? "Complete" : (row.run || "Train");
         sub.append(kindLabel);
+        if (row.data_hash) {
+          const hash = document.createElement("span");
+          hash.textContent = row.data_hash.slice(0, 8);
+          sub.append(hash);
+        }
         if (row.params) {
           const size = document.createElement("span");
           size.textContent = row.params;
@@ -1146,7 +1208,9 @@
           runStat("train", Number.isFinite(row.train_loss) ? formatLoss(row.train_loss) : ""),
           runStat("ref", Number.isFinite(row.reference_loss) ? formatLoss(row.reference_loss) : ""),
         ];
-        if (row.status !== "ready" && row.iters) {
+        if (row.status === "ready" && row.iters) {
+          items.splice(2, 0, runStat("steps", row.iters.toLocaleString()));
+        } else if (row.status !== "ready" && row.iters) {
           items.splice(2, 0, runStat("steps", (row.iter || 0).toLocaleString() + "/" + row.iters.toLocaleString()));
         }
         items.filter(Boolean).forEach((item) => stats.appendChild(item));
@@ -1172,15 +1236,21 @@
       stopBtn.hidden = !busy;
       stopBtn.disabled = s.phase === "cancelling";
       modelSelect.disabled = busy;
+      if (itersInput) itersInput.disabled = busy;
+      if (resumeSelect) resumeSelect.disabled = busy;
       if (whoBtn) {
         whoBtn.disabled = busy;
         if (busy) closeWho();
       }
       syncModelPicker(s);
       updateModelSummary(model);
-      syncChatPicker(s);
-      const chatting = chatModelInfo(s);
-      const chatReady = !!(chatting && chatting.has_adapter);
+      syncResumePicker(s);
+      const preferChat = wasBusy && !busy && s.model && s.run_id
+        && (s.phase === "ready" || s.phase === "cancelled")
+        ? s.model + "/" + s.run_id + "/latest"
+        : null;
+      syncChatPicker(s, preferChat);
+      const chatReady = !!(chatSelect.value && !chatPicker.hidden);
       sendBtn.disabled = busy || !chatReady || sending;
       input.disabled = busy || !chatReady;
       if (!s.mlx) {
@@ -1225,13 +1295,13 @@
         if (person && s.model && person.trained && person.trained.indexOf(s.model) < 0) {
           person.trained.push(s.model);
         }
-        if (s.model && Array.from(chatSelect.options).some((opt) => opt.value === s.model) && chatSelect.value !== s.model) {
-          chatSelect.value = s.model;
-          history.length = 0;
-          thread.replaceChildren();
-        }
+        history.length = 0;
+        thread.replaceChildren();
         showTab("chat", true);
         setHash("chat");
+        loadPeople();
+      } else if (wasBusy && !busy) {
+        loadPeople();
       }
       wasBusy = busy;
       emptyState();
@@ -1243,14 +1313,14 @@
         } else if (s.phase === "error") {
           hintEl.textContent = "The previous run stopped. Quick is the shortest way to verify the setup before retrying Complete.";
         } else if (s.phase === "cancelled") {
-          hintEl.textContent = "Training was stopped. Start again when you want to fit this model.";
+          hintEl.textContent = "Training was stopped. Saved checkpoints stay available to chat with or continue from.";
         } else if (busy && s.examples) {
           const who = isYou(selectedPerson()) ? "sent texts" : "texts";
           hintEl.textContent = s.examples.toLocaleString() + " examples cover " + s.sent_texts.toLocaleString() + " " + who + " across " + s.chats.toLocaleString() + " chats" + (s.augmented ? ", including " + s.augmented.toLocaleString() + " short-context variants." : ".");
         } else if (modelReady) {
-          hintEl.textContent = "This adapter stays paired with " + model.name + ". Training another size creates a separate adapter.";
+          hintEl.textContent = "Each train writes a new adapter. Earlier checkpoints stay in the chat list.";
         } else {
-          hintEl.textContent = "Quick uses a small recent slice. Complete uses every chat and makes one pass through all generated examples.";
+          hintEl.textContent = "Quick uses 30 steps on a recent slice. Complete uses every chat. Leave steps blank for the default, or continue from a checkpoint.";
         }
       }
       if (busy && !pollTimer) {
@@ -1326,13 +1396,20 @@
     trainBtn.addEventListener("click", async () => {
       const run = (page.querySelector('input[name="twinrun"]:checked') || {}).value || "complete";
       const model = selectedModel();
+      const rawIters = itersInput ? itersInput.value.trim() : "";
+      const iters = rawIters === "" ? null : Number(rawIters);
+      if (rawIters !== "" && (!Number.isInteger(iters) || iters < 1)) {
+        statusEl.textContent = "Steps must be a whole number of 1 or more.";
+        return;
+      }
+      const resume = resumeSelect ? resumeSelect.value : "";
       trainBtn.disabled = true;
       showTrainingScreen();
       try {
         const res = await fetch("/twin/train", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ run, model, person: personId }),
+          body: JSON.stringify({ run, model, person: personId, iters, resume: resume || undefined }),
         });
         const data = await res.json();
         applyStatus(data);
@@ -1395,7 +1472,7 @@
         const res = await fetch("/twin/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, history, model: chatModel(), person: personId }),
+          body: JSON.stringify({ text, history, adapter: chatModel(), person: personId }),
         });
         const data = await res.json();
         const bubble = pending.querySelector(".bubble");

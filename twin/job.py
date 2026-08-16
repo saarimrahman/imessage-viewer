@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import signal
 import threading
 import time
@@ -19,11 +20,19 @@ from twin.export import (
 )
 from twin.train import (
     DEFAULT_MODEL,
+    MAX_ITERS,
     MODELS,
     TWIN_DIR,
     adapter_dir,
+    hash_train_file,
     has_adapter,
+    has_weights,
+    list_adapter_runs,
+    make_run_id,
     model_config,
+    parse_checkpoint_id,
+    read_run_metadata,
+    resolve_checkpoint,
     resolved_adapter_dir,
     run_train,
     steps_for_examples,
@@ -78,6 +87,9 @@ _state = {
     "person": ME,
     "person_name": "You",
     "run": "complete",
+    "run_id": "",
+    "data_hash": "",
+    "resume_from": "",
     "metrics": [],
     "started_at": None,
     "phase_started_at": None,
@@ -236,6 +248,9 @@ def snapshot(brief=False):
             "person": person_id,
             "person_name": person_name,
             "run": _state["run"],
+            "run_id": _state.get("run_id") or "",
+            "data_hash": _state.get("data_hash") or "",
+            "resume_from": _state.get("resume_from") or "",
             "busy": phase in BUSY_PHASES,
             "has_adapter": has_adapter(model_key, person_id=person_id),
             "started_at": started_at,
@@ -255,6 +270,7 @@ def snapshot(brief=False):
         return out | {
             "metrics": [dict(point) for point in _state["metrics"]],
             "models": public_models(person_id),
+            "adapter_runs": list_adapter_runs(person_id),
             "runs": [dict(row) for row in _runs_locked()[:MAX_RUNS]],
         }
 
@@ -280,19 +296,38 @@ def list_people():
             "trained": [
                 key for key in MODELS if has_adapter(key, person_id=subject["id"])
             ],
+            "adapters": list_adapter_runs(subject["id"]),
             "avatar": avatar_html(subject["name"], subject["handle"]),
         }
         for subject in list_subjects()
     ]
 
 
-def start_train(run="complete", model_key=DEFAULT_MODEL, person_id=ME):
+def start_train(
+    run="complete",
+    model_key=DEFAULT_MODEL,
+    person_id=ME,
+    iters=None,
+    resume_from=None,
+):
     if run not in ("quick", "complete"):
         return False, "run must be quick or complete"
+    if iters is not None:
+        try:
+            iters = int(iters)
+        except (TypeError, ValueError):
+            return False, "steps must be a number"
+        if iters < 1 or iters > MAX_ITERS:
+            return False, f"steps must be between 1 and {MAX_ITERS:,}"
+    resume = None
     try:
         config = model_config(model_key)
         person_id = parse_person_arg(person_id)
         subject = resolve_subject(person_id)
+        if resume_from:
+            resume = resolve_checkpoint(resume_from, subject["id"])
+            if resume["model"] != model_key:
+                return False, "Resume from a checkpoint of the same model."
     except ValueError as e:
         return False, str(e)
     now = time.time()
@@ -304,7 +339,7 @@ def start_train(run="complete", model_key=DEFAULT_MODEL, person_id=ME):
             phase="inspecting",
             detail="Auditing the complete message archive…",
             iter=0,
-            iters=SMOKE_ITERS if run == "quick" else 0,
+            iters=iters if iters is not None else (SMOKE_ITERS if run == "quick" else 0),
             examples=0,
             sent_texts=0,
             chats=0,
@@ -313,6 +348,9 @@ def start_train(run="complete", model_key=DEFAULT_MODEL, person_id=ME):
             person=subject["id"],
             person_name=subject["name"],
             run=run,
+            run_id="",
+            data_hash="",
+            resume_from=resume["id"] if resume else "",
             metrics=[],
             started_at=now,
             phase_started_at=now,
@@ -323,7 +361,7 @@ def start_train(run="complete", model_key=DEFAULT_MODEL, person_id=ME):
         _drop_model_locked()
         _begin_run_locked(config, run, now, subject)
     threading.Thread(
-        target=_train_worker, args=(run, model_key, subject), daemon=True
+        target=_train_worker, args=(run, model_key, subject, iters, resume), daemon=True
     ).start()
     return True, ""
 
@@ -450,6 +488,9 @@ def _begin_run_locked(config, run, now, subject):
         "person_name": subject["name"],
         "status": "running",
         "started_at": now,
+        "run_id": "",
+        "data_hash": "",
+        "resume_from": _state.get("resume_from") or "",
     }
     runs = [row, *[r for r in _runs_locked() if r.get("status") != "running"]]
     _save_runs_locked(runs)
@@ -481,6 +522,9 @@ def _complete_run(status):
                 "sent_texts": _state.get("sent_texts") or 0,
                 "chats": _state.get("chats") or 0,
                 "augmented": _state.get("augmented") or 0,
+                "run_id": _state.get("run_id") or "",
+                "data_hash": _state.get("data_hash") or "",
+                "resume_from": _state.get("resume_from") or "",
                 "train_loss": train_loss,
                 "reference_loss": reference_loss,
                 "detail": _state.get("detail") or "",
@@ -489,14 +533,15 @@ def _complete_run(status):
         _save_runs_locked(runs)
 
 
-def _train_worker(run, model_key, subject):
+def _train_worker(run, model_key, subject, custom_iters=None, resume=None):
     # MLX generation and training share the same GPU memory pool. Let an active
     # reply finish before training starts, then block new replies until it ends.
     with _gen_lock:
-        _train_worker_exclusive(run, model_key, subject)
+        _train_worker_exclusive(run, model_key, subject, custom_iters, resume)
 
 
-def _train_worker_exclusive(run, model_key, subject):
+def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=None):
+    target_adapter = None
     try:
         if _cancel.is_set():
             raise TwinCancelled()
@@ -513,9 +558,52 @@ def _train_worker_exclusive(run, model_key, subject):
         if _cancel.is_set():
             raise TwinCancelled()
         config = model_config(model_key)
-        iters = SMOKE_ITERS if is_quick else steps_for_examples(
-            stats["train"], config["batch_size"]
+        iters = custom_iters if custom_iters is not None else (
+            SMOKE_ITERS if is_quick else steps_for_examples(
+                stats["train"], config["batch_size"]
+            )
         )
+        data_hash = hash_train_file(TWIN_DIR)
+        created = time.time()
+        root = adapter_dir(model_key, subject["id"])
+        os.makedirs(root, exist_ok=True)
+        run_id = make_run_id(created, data_hash, iters, root)
+        target_adapter = os.path.join(root, run_id)
+        os.makedirs(target_adapter, exist_ok=True)
+        metadata = {
+            "model": model_key,
+            "repo": config["repo"],
+            "person": subject["id"],
+            "person_name": subject["name"],
+            "run_id": run_id,
+            "created_at": created,
+            "data_hash": data_hash,
+            "examples": stats["train"],
+            "sent_texts": stats["sent_texts"],
+            "chats": stats["chats"],
+            "augmented": stats["augmented"],
+            "iters": iters,
+            "run": run,
+            "batch_size": config["batch_size"],
+            "layers": config["layers"],
+            "resume_from": resume["id"] if resume else "",
+            "status": "running",
+        }
+        write_run_metadata(target_adapter, metadata)
+        _set(
+            examples=stats["train"],
+            sent_texts=stats["sent_texts"],
+            chats=stats["chats"],
+            augmented=stats["augmented"],
+            iters=iters,
+            run_id=run_id,
+            data_hash=data_hash,
+        )
+        with _lock:
+            current = next((row for row in _runs_locked() if row.get("status") == "running"), None)
+            if current:
+                current.update(run_id=run_id, data_hash=data_hash, iters=iters)
+                _save_runs_locked(_runs_locked())
         cached = config["repo"] in cached_model_repos()
         if cached:
             load_phase = "loading"
@@ -525,15 +613,7 @@ def _train_worker_exclusive(run, model_key, subject):
             load_detail = (
                 f"Downloading {config['name']} {config['params']} · {config['download']}…"
             )
-        _set(
-            examples=stats["train"],
-            sent_texts=stats["sent_texts"],
-            chats=stats["chats"],
-            augmented=stats["augmented"],
-            iters=iters,
-            phase=load_phase,
-            detail=load_detail,
-        )
+        _set(phase=load_phase, detail=load_detail)
 
         saw_iter = False
 
@@ -566,7 +646,6 @@ def _train_worker_exclusive(run, model_key, subject):
 
         if _cancel.is_set():
             raise TwinCancelled()
-        target_adapter = adapter_dir(model_key, subject["id"])
         try:
             run_train(
                 iters=iters,
@@ -576,6 +655,7 @@ def _train_worker_exclusive(run, model_key, subject):
                 num_layers=config["layers"],
                 on_line=on_line,
                 on_proc=_remember_proc,
+                resume_adapter_file=resume["weights"] if resume else None,
             )
         except RuntimeError:
             if _cancel.is_set():
@@ -583,37 +663,39 @@ def _train_worker_exclusive(run, model_key, subject):
             raise
         if _cancel.is_set():
             raise TwinCancelled()
-        write_run_metadata(
-            target_adapter,
-            {
-                "model": model_key,
-                "repo": config["repo"],
-                "person": subject["id"],
-                "person_name": subject["name"],
-                "examples": stats["train"],
-                "sent_texts": stats["sent_texts"],
-                "chats": stats["chats"],
-                "augmented": stats["augmented"],
-                "iters": iters,
-                "run": run,
-            },
-        )
+        metadata["status"] = "ready"
+        write_run_metadata(target_adapter, metadata)
         _set(phase="ready", detail="Adapter ready.", iter=iters)
         _complete_run("ready")
     except TwinCancelled:
+        if target_adapter and has_weights(target_adapter):
+            meta = {
+                **(read_run_metadata(target_adapter)),
+                "status": "cancelled",
+            }
+            write_run_metadata(target_adapter, meta)
+        elif target_adapter:
+            shutil.rmtree(target_adapter, ignore_errors=True)
         _set(phase="cancelled", detail="Training stopped.")
         _complete_run("cancelled")
     except Exception as e:
+        if target_adapter and not has_weights(target_adapter):
+            shutil.rmtree(target_adapter, ignore_errors=True)
+        elif target_adapter:
+            write_run_metadata(
+                target_adapter,
+                {**(read_run_metadata(target_adapter)), "status": "error"},
+            )
         _set(phase="error", detail=str(e))
         _complete_run("error")
     finally:
         _remember_proc(None)
 
 
-def _load_model(model_key, person_id=ME):
+def _load_model(model_key, person_id=ME, run_id=None, step="latest"):
     global _model, _tokenizer, _loaded_key
     config = model_config(model_key)
-    loaded = (model_key, person_id)
+    loaded = (model_key, person_id, run_id or "", str(step or "latest"))
     with _lock:
         if _model is not None and _loaded_key == loaded:
             return _model, _tokenizer
@@ -626,12 +708,15 @@ def _load_model(model_key, person_id=ME):
                 "mlx-lm is not installed. Run: "
                 "./.venv/bin/python -m pip install -r twin/requirements.txt"
             )
+    adapter_path = resolved_adapter_dir(
+        model_key, person_id, run_id=run_id, step=step
+    )
+    if not os.path.isfile(os.path.join(adapter_path, "adapters.safetensors")):
+        raise TwinError(f"{config['name']} has not been trained yet.")
     try:
         from mlx_lm import load
 
-        model, tokenizer = load(
-            config["repo"], adapter_path=resolved_adapter_dir(model_key, person_id)
-        )
+        model, tokenizer = load(config["repo"], adapter_path=adapter_path)
     except Exception as e:
         raise TwinError(f"Could not load {config['name']}: {e}") from e
     with _lock:
@@ -639,18 +724,22 @@ def _load_model(model_key, person_id=ME):
         return _model, _tokenizer
 
 
-def chat(text, history=None, model_key=DEFAULT_MODEL, person_id=ME):
+def chat(text, history=None, model_key=DEFAULT_MODEL, person_id=ME, adapter=None):
     text = (text or "").strip()
     if not text:
         raise TwinError("Empty message.")
+    run_id = None
+    step = "latest"
     try:
-        config = model_config(model_key)
         person_id = parse_person_arg(person_id)
         subject = resolve_subject(person_id)
+        if adapter:
+            model_key, run_id, step = parse_checkpoint_id(adapter)
+        config = model_config(model_key)
     except ValueError as e:
         raise TwinError(str(e)) from e
     with _gen_lock:
-        model, tokenizer = _load_model(model_key, person_id)
+        model, tokenizer = _load_model(model_key, person_id, run_id, step)
         from mlx_lm import generate
 
         messages = [{"role": "system", "content": system_for(subject["name"])}]

@@ -153,10 +153,15 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["twin", "train"]:
             run = body.get("run") or "complete"
             model = body.get("model") or "balanced"
+            iters = body.get("iters")
+            if iters in ("", None):
+                iters = None
             ok, err = start_train(
                 run=run,
                 model_key=model,
                 person_id=body.get("person") or "me",
+                iters=iters,
+                resume_from=body.get("resume") or None,
             )
             if not ok:
                 self._send_json({"error": err, **twin_snapshot()}, status=409)
@@ -178,6 +183,7 @@ class Handler(BaseHTTPRequestHandler):
                     history,
                     model_key=body.get("model") or "balanced",
                     person_id=body.get("person") or "me",
+                    adapter=body.get("adapter") or None,
                 )
             except TwinError as e:
                 self._send_json({"error": str(e)}, status=409)

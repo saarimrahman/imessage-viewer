@@ -2,11 +2,14 @@
 """Train model-specific QLoRA adapters with MLX LM."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -279,6 +282,10 @@ MODELS = {
 }
 DEFAULT_MODEL = "qwen3-capable"
 MODEL = MODELS["compact"]["repo"]  # Backwards-compatible public constant.
+ADAPTER_WEIGHTS = "adapters.safetensors"
+LEGACY_RUN = "legacy"
+MAX_ITERS = 1_000_000
+CHECKPOINT_RE = re.compile(r"^(\d{7})_adapters\.safetensors$")
 
 
 def model_config(model_key):
@@ -294,31 +301,269 @@ def adapter_dir(model_key, person_id="me"):
     return os.path.join(TWIN_DIR, "people", person_id, "adapters", model_key)
 
 
+def run_dir(model_key, run_id, person_id="me"):
+    if run_id == LEGACY_RUN:
+        return adapter_dir(model_key, person_id)
+    return os.path.join(adapter_dir(model_key, person_id), run_id)
+
+
 # Existing callers/tests imported ADAPTER before model selection existed.
 ADAPTER = adapter_dir("compact")
 
 
+def has_weights(path):
+    return os.path.isfile(os.path.join(path, ADAPTER_WEIGHTS)) or bool(
+        checkpoint_steps(path)
+    )
+
+
+def checkpoint_steps(path):
+    if not os.path.isdir(path):
+        return []
+    steps = []
+    for name in os.listdir(path):
+        match = CHECKPOINT_RE.match(name)
+        if match:
+            steps.append(int(match.group(1)))
+    return sorted(steps)
+
+
 def has_adapter(model_key="compact", adapter=None, person_id="me"):
-    path = adapter or adapter_dir(model_key, person_id)
-    current = os.path.isfile(os.path.join(path, "adapters.safetensors"))
     if adapter is not None:
-        return current
-    # Recognize the adapter produced by the first Twin implementation.
-    if (not person_id or person_id == "me") and model_key == "compact" and not current:
-        legacy = os.path.join(TWIN_DIR, "adapters", "adapters.safetensors")
-        return os.path.isfile(legacy)
-    return current
+        return has_weights(adapter)
+    return bool(iter_run_paths(model_key, person_id))
 
 
-def resolved_adapter_dir(model_key, person_id="me"):
-    path = adapter_dir(model_key, person_id)
-    if has_adapter(model_key, path):
-        return path
-    if (not person_id or person_id == "me") and model_key == "compact":
+def iter_run_paths(model_key, person_id="me"):
+    """Yield (run_id, path) for adapter folders that have trainable weights."""
+    root = adapter_dir(model_key, person_id)
+    if has_weights(root):
+        yield LEGACY_RUN, root
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            if name in (LEGACY_RUN, ".load"):
+                continue
+            path = os.path.join(root, name)
+            if os.path.isdir(path) and has_weights(path):
+                yield name, path
+    if (
+        (not person_id or person_id == "me")
+        and model_key == "compact"
+        and not has_weights(root)
+    ):
         legacy = os.path.join(TWIN_DIR, "adapters")
-        if os.path.isfile(os.path.join(legacy, "adapters.safetensors")):
-            return legacy
-    return path
+        if has_weights(legacy) and legacy != root:
+            yield LEGACY_RUN, legacy
+
+
+def read_run_metadata(path):
+    try:
+        with open(os.path.join(path, "twin_run.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def hash_train_file(data_dir):
+    path = os.path.join(data_dir, "train.jsonl")
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:12]
+
+
+def make_run_id(created_at, data_hash, iters, root):
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(created_at))
+    base = f"{stamp}-{data_hash}-{int(iters)}"
+    candidate = base
+    extra = 2
+    while os.path.exists(os.path.join(root, candidate)):
+        candidate = f"{base}-{extra}"
+        extra += 1
+    return candidate
+
+
+def parse_checkpoint_id(value):
+    text = (value or "").strip()
+    parts = text.split("/")
+    if len(parts) < 3:
+        raise ValueError("Checkpoint id must be model/run/step.")
+    model_key, step = parts[0], parts[-1]
+    run_id = "/".join(parts[1:-1])
+    if model_key not in MODELS:
+        raise ValueError(f"Unknown model: {model_key}")
+    if not run_id:
+        raise ValueError("Checkpoint id is missing a run.")
+    if step != "latest" and not step.isdigit():
+        raise ValueError("Checkpoint step must be latest or a number.")
+    return model_key, run_id, step
+
+
+def checkpoint_id(model_key, run_id, step="latest"):
+    return f"{model_key}/{run_id}/{step}"
+
+
+def checkpoint_weight_file(path, step="latest"):
+    if step == "latest" or step is None:
+        latest = os.path.join(path, ADAPTER_WEIGHTS)
+        if os.path.isfile(latest):
+            return latest
+        steps = checkpoint_steps(path)
+        if not steps:
+            return None
+        step = steps[-1]
+    numbered = os.path.join(path, f"{int(step):07d}_{ADAPTER_WEIGHTS}")
+    return numbered if os.path.isfile(numbered) else None
+
+
+def resolve_checkpoint(value, person_id="me"):
+    model_key, run_id, step = parse_checkpoint_id(value)
+    path = None
+    for found_id, found_path in iter_run_paths(model_key, person_id):
+        if found_id == run_id:
+            path = found_path
+            break
+    if path is None:
+        raise ValueError("That checkpoint does not exist.")
+    weights = checkpoint_weight_file(path, step)
+    if not weights:
+        raise ValueError("That checkpoint has no saved weights.")
+    return {
+        "id": checkpoint_id(model_key, run_id, step),
+        "model": model_key,
+        "run_id": run_id,
+        "step": step,
+        "path": path,
+        "weights": weights,
+    }
+
+
+def _replace_link(dest, src):
+    if os.path.lexists(dest):
+        os.remove(dest)
+    os.symlink(os.path.abspath(src), dest)
+
+
+def load_dir_for(path, step="latest"):
+    """Directory MLX can load: adapter_config.json + adapters.safetensors."""
+    weights = checkpoint_weight_file(path, step)
+    if not weights:
+        return path
+    latest = os.path.join(path, ADAPTER_WEIGHTS)
+    if os.path.abspath(weights) == os.path.abspath(latest):
+        return path
+    step_n = int(step) if str(step).isdigit() else checkpoint_steps(path)[-1]
+    dest_dir = os.path.join(path, ".load", str(step_n))
+    os.makedirs(dest_dir, exist_ok=True)
+    _replace_link(os.path.join(dest_dir, ADAPTER_WEIGHTS), weights)
+    config = os.path.join(path, "adapter_config.json")
+    if os.path.isfile(config):
+        _replace_link(os.path.join(dest_dir, "adapter_config.json"), config)
+    return dest_dir
+
+
+def resolved_adapter_dir(model_key, person_id="me", run_id=None, step="latest"):
+    if run_id:
+        path = run_dir(model_key, run_id, person_id)
+        if run_id == LEGACY_RUN and not has_weights(path):
+            fallback = os.path.join(TWIN_DIR, "adapters")
+            if (
+                (not person_id or person_id == "me")
+                and model_key == "compact"
+                and has_weights(fallback)
+            ):
+                path = fallback
+        return load_dir_for(path, step)
+    runs = list(iter_run_paths(model_key, person_id))
+    if not runs:
+        return adapter_dir(model_key, person_id)
+    latest_id, latest_path = _newest_run(runs)
+    return load_dir_for(latest_path, "latest")
+
+
+def _path_created_at(path, meta=None):
+    meta = meta if meta is not None else read_run_metadata(path)
+    created = meta.get("created_at")
+    if isinstance(created, (int, float)) and created > 0:
+        return created
+    try:
+        return os.path.getmtime(os.path.join(path, ADAPTER_WEIGHTS))
+    except OSError:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0
+
+
+def _newest_run(runs):
+    return max(runs, key=lambda item: _path_created_at(item[1]))
+
+
+def public_checkpoints(path, model_key, run_id, iters=0, status=""):
+    numbered = checkpoint_steps(path)
+    if status == "ready" and iters:
+        latest_n = iters
+    elif numbered:
+        latest_n = numbered[-1]
+    else:
+        latest_n = iters or 0
+    out = [
+        {
+            "id": checkpoint_id(model_key, run_id, "latest"),
+            "step": "latest",
+            "step_n": latest_n,
+        }
+    ]
+    for step in reversed(numbered):
+        if latest_n and step == latest_n:
+            continue
+        out.append(
+            {
+                "id": checkpoint_id(model_key, run_id, step),
+                "step": step,
+                "step_n": step,
+            }
+        )
+    return out
+
+
+def list_adapter_runs(person_id="me", model_key=None):
+    keys = [model_key] if model_key else list(MODELS)
+    runs = []
+    for key in keys:
+        config = MODELS[key]
+        for run_id, path in iter_run_paths(key, person_id):
+            meta = read_run_metadata(path)
+            iters = int(meta["iters"]) if meta.get("iters") else 0
+            created = _path_created_at(path, meta)
+            runs.append(
+                {
+                    "id": f"{key}/{run_id}",
+                    "model": key,
+                    "run_id": run_id,
+                    "name": config["name"],
+                    "params": config["params"],
+                    "created_at": created,
+                    "data_hash": meta.get("data_hash") or "",
+                    "iters": iters,
+                    "examples": int(meta["examples"]) if meta.get("examples") else 0,
+                    "run": meta.get("run") or ("legacy" if run_id == LEGACY_RUN else ""),
+                    "resume_from": meta.get("resume_from") or "",
+                    "checkpoints": public_checkpoints(
+                        path, key, run_id, iters, meta.get("status") or ""
+                    ),
+                }
+            )
+    runs.sort(key=lambda row: row["created_at"], reverse=True)
+    return runs
+
+
+def save_every_for(iters):
+    if iters <= 50:
+        return max(iters, 1)
+    return max(50, iters // 20)
 
 
 def steps_for_examples(examples, batch_size):
@@ -336,8 +581,10 @@ def train_command(
     max_seq_length=768,
     steps_per_report=10,
     steps_per_eval=100,
+    save_every=None,
+    resume_adapter_file=None,
 ):
-    return [
+    cmd = [
         sys.executable,
         "-u",
         "-m",
@@ -368,10 +615,13 @@ def train_command(
         "--val-batches",
         "25",
         "--save-every",
-        str(max(iters, 1)),
+        str(save_every if save_every is not None else save_every_for(iters)),
         "--seed",
         "0",
     ]
+    if resume_adapter_file:
+        cmd.extend(["--resume-adapter-file", resume_adapter_file])
+    return cmd
 
 
 def write_run_metadata(adapter, metadata):
@@ -390,6 +640,7 @@ def run_train(
     max_seq_length=768,
     on_line=None,
     on_proc=None,
+    resume_adapter_file=None,
 ):
     train_path = os.path.join(data, "train.jsonl")
     if not os.path.exists(train_path):
@@ -406,6 +657,8 @@ def run_train(
         max_seq_length=max_seq_length,
         steps_per_report=steps_per_report,
         steps_per_eval=steps_per_eval,
+        save_every=save_every_for(iters),
+        resume_adapter_file=resume_adapter_file,
     )
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -437,7 +690,7 @@ def run_train(
 def main():
     parser = argparse.ArgumentParser(description="LoRA-tune a local texting twin")
     parser.add_argument("--model-key", choices=MODELS, default="compact")
-    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=None)
     parser.add_argument(
         "--complete",
         action="store_true",
@@ -445,6 +698,10 @@ def main():
     )
     parser.add_argument("--data", default=TWIN_DIR)
     parser.add_argument("--adapter")
+    parser.add_argument(
+        "--resume",
+        help="Checkpoint id (model/run/step) or path to adapters.safetensors",
+    )
     parser.add_argument(
         "--person",
         default="me",
@@ -458,8 +715,11 @@ def main():
     except ValueError as e:
         sys.exit(str(e))
     config = model_config(args.model_key)
-    iters = args.iters
-    if args.complete:
+    if args.iters is not None:
+        if args.iters < 1 or args.iters > MAX_ITERS:
+            sys.exit(f"--iters must be between 1 and {MAX_ITERS:,}")
+        iters = args.iters
+    elif args.complete:
         train_path = os.path.join(args.data, "train.jsonl")
         try:
             with open(train_path, encoding="utf-8") as f:
@@ -467,20 +727,64 @@ def main():
         except OSError:
             sys.exit("No training data. Run: ./.venv/bin/python twin/export.py")
         iters = steps_for_examples(examples, config["batch_size"])
+    else:
+        iters = 10
+
+    resume_file = None
+    if args.resume:
+        if os.path.isfile(args.resume):
+            resume_file = args.resume
+        else:
+            try:
+                resume_file = resolve_checkpoint(args.resume, person_id)["weights"]
+            except ValueError as e:
+                sys.exit(str(e))
+
+    created = time.time()
+    adapter = args.adapter
+    data_hash = ""
+    run_id = ""
+    if not adapter:
+        try:
+            data_hash = hash_train_file(args.data)
+        except OSError:
+            sys.exit("No training data. Run: ./.venv/bin/python twin/export.py")
+        root = adapter_dir(args.model_key, person_id)
+        os.makedirs(root, exist_ok=True)
+        run_id = make_run_id(created, data_hash, iters, root)
+        adapter = os.path.join(root, run_id)
+    meta = {
+        "model": args.model_key,
+        "repo": config["repo"],
+        "person": person_id,
+        "run_id": run_id or os.path.basename(adapter),
+        "created_at": created,
+        "data_hash": data_hash,
+        "iters": iters,
+        "run": "complete" if args.complete else "custom",
+        "resume_from": args.resume or "",
+        "status": "running",
+    }
+    write_run_metadata(adapter, meta)
 
     try:
         run_train(
             iters=iters,
             model=config["repo"],
             data=args.data,
-            adapter=args.adapter or adapter_dir(args.model_key, person_id),
+            adapter=adapter,
             batch_size=config["batch_size"],
             num_layers=config["layers"],
+            resume_adapter_file=resume_file,
         )
     except FileNotFoundError:
         sys.exit("No training data. Run: ./.venv/bin/python twin/export.py")
     except RuntimeError:
+        meta["status"] = "error"
+        write_run_metadata(adapter, meta)
         sys.exit(1)
+    meta["status"] = "ready"
+    write_run_metadata(adapter, meta)
 
 
 if __name__ == "__main__":

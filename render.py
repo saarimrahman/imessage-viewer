@@ -2021,14 +2021,55 @@ def render_twin():
         (m for m in s["models"] if m["key"] == selected_model),
         s["models"][0],
     )
-    trained_models = [m for m in s["models"] if m["has_adapter"]]
-    chat_selected = next(
-        (m for m in trained_models if m["key"] == selected_model),
-        trained_models[0] if trained_models else None,
-    )
-    send_dis = " disabled" if (not chat_selected or s["busy"]) else ""
-    chat_select_dis = " disabled" if (s["busy"] or not chat_selected) else ""
-    chat_picker_hidden = "" if chat_selected else " hidden"
+    adapter_runs = s.get("adapter_runs") or []
+    chat_ready = bool(adapter_runs)
+    send_dis = " disabled" if (not chat_ready or s["busy"]) else ""
+    chat_select_dis = " disabled" if (s["busy"] or not chat_ready) else ""
+    chat_picker_hidden = "" if chat_ready else " hidden"
+
+    def run_label(run):
+        bits = [run.get("name") or run.get("model") or "Model"]
+        if run.get("params"):
+            bits.append(run["params"])
+        created = run.get("created_at")
+        if isinstance(created, (int, float)) and created > 0:
+            bits.append(datetime.fromtimestamp(created).strftime("%b %-d, %-I:%M %p"))
+        if run.get("iters"):
+            bits.append(f'{int(run["iters"]):,} steps')
+        if run.get("data_hash"):
+            bits.append(str(run["data_hash"])[:8])
+        return " · ".join(bits)
+
+    def checkpoint_label(ckpt):
+        if ckpt.get("step") == "latest":
+            n = ckpt.get("step_n") or 0
+            return f"Latest · {int(n):,} steps" if n else "Latest"
+        return f'Step {int(ckpt["step_n"] or ckpt["step"]):,}'
+
+    def options_for_runs(runs, selected_id=""):
+        chunks = []
+        for run in runs:
+            ckpts = run.get("checkpoints") or []
+            if not ckpts:
+                continue
+            label = html.escape(run_label(run))
+            if len(ckpts) == 1:
+                ckpt = ckpts[0]
+                selected = " selected" if ckpt["id"] == selected_id else ""
+                chunks.append(
+                    f'<option value="{html.escape(ckpt["id"])}"{selected}>{label}</option>'
+                )
+                continue
+            chunks.append(f'<optgroup label="{label}">')
+            for ckpt in ckpts:
+                selected = " selected" if ckpt["id"] == selected_id else ""
+                chunks.append(
+                    f'<option value="{html.escape(ckpt["id"])}"{selected}>'
+                    f"{html.escape(checkpoint_label(ckpt))}</option>"
+                )
+            chunks.append("</optgroup>")
+        return "".join(chunks)
+
     model_groups = {}
     for model in s["models"]:
         suffix = " · trained" if model["has_adapter"] else ""
@@ -2043,13 +2084,13 @@ def render_twin():
         f'<optgroup label="{html.escape(category)}">{"".join(options)}</optgroup>'
         for category, options in model_groups.items()
     )
-    chat_options = "".join(
-        (
-            f'<option value="{html.escape(model["key"])}"'
-            f'{" selected" if chat_selected and model["key"] == chat_selected["key"] else ""}>'
-            f'{html.escape(model["name"])} · {html.escape(model["params"])}</option>'
-        )
-        for model in trained_models
+    first_chat = ""
+    if adapter_runs and adapter_runs[0].get("checkpoints"):
+        first_chat = adapter_runs[0]["checkpoints"][0]["id"]
+    chat_options = options_for_runs(adapter_runs, first_chat)
+    resume_runs = [run for run in adapter_runs if run.get("model") == selected_model]
+    resume_options = '<option value="" selected>Fresh weights</option>' + options_for_runs(
+        resume_runs
     )
     model_badges = "".join(
         (
@@ -2077,12 +2118,13 @@ def render_twin():
         )
     else:
         hint = (
-            "Quick proves the loop on a small recent slice. Complete scans every chat, "
-            "creates real context variants, and makes one pass through the full dataset."
+            "Quick is a 30-step smoke test. Complete uses every chat. "
+            "Leave steps blank for the default, or continue from a saved checkpoint. "
+            "Each train writes a new adapter and leaves earlier ones alone."
         )
     if s["busy"] or s["phase"] in ("error", "cancelled"):
         default_tab = "model"
-    elif trained_models:
+    elif adapter_runs:
         default_tab = "chat"
     else:
         default_tab = "audit"
@@ -2162,12 +2204,25 @@ def render_twin():
 </article>
 </div>
 <div class="twin-launch">
-<div>
+<div class="twin-launch-main">
 <p class="twin-eyebrow">Train</p>
 <div class="seg" id="twinRun">
 <label class="seg-btn"><input type="radio" name="twinrun" value="quick"> Quick</label>
 <label class="seg-btn"><input type="radio" name="twinrun" value="complete" checked> Complete</label>
 </div>
+</div>
+<div class="twin-launch-opts">
+<label class="twin-launch-field" for="twinIters">
+<span>Steps</span>
+<input class="field twin-iters" id="twinIters" name="twiniters" type="number" min="1" max="1000000" inputmode="numeric" placeholder="Auto"{select_dis}>
+</label>
+<label class="twin-launch-field twin-launch-resume" for="twinResume">
+<span>Start from</span>
+<div class="twin-select-wrap">
+<select class="twin-model-select twin-resume-select" id="twinResume" name="twinresume"{select_dis}>{resume_options}</select>
+<span class="twin-select-arrow" aria-hidden="true">⌄</span>
+</div>
+</label>
 </div>
 <button type="button" class="btn btn-primary twin-train-btn" id="twinTrain"{train_dis}>Train locally</button>
 </div>
@@ -2213,7 +2268,7 @@ def render_twin():
 <div class="twin-chat-head">
 <div><h2 id="twinChatTitle">Text your twin</h2></div>
 <div class="twin-select-wrap twin-chat-select-wrap" id="twinChatPicker"{chat_picker_hidden}>
-<select class="twin-model-select twin-chat-select" id="twinChatSelect" name="twinchat" aria-label="Trained model"{chat_select_dis}>{chat_options}</select>
+<select class="twin-model-select twin-chat-select" id="twinChatSelect" name="twinchat" aria-label="Trained checkpoint"{chat_select_dis}>{chat_options}</select>
 <span class="twin-select-arrow" aria-hidden="true">⌄</span>
 </div>
 </div>

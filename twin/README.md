@@ -42,7 +42,11 @@ Open <http://127.0.0.1:8765/twin>.
 
 Quick uses 160 recent examples and 30 steps. Use this run to make sure that local training works.
 
-Complete builds the full dataset. Then it makes one pass through all generated examples. This run can take a long time.
+Complete builds the full dataset. Then it makes one pass through all generated examples unless you set a step count.
+
+Each train writes a new adapter folder named with the start time, a hash of `train.jsonl`, and the step count. Earlier adapters stay on disk. Long runs save checkpoints about every 5% of the step count. Stop mid-run and you can chat with the last save, or continue from it.
+
+The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. The Model tab can start from fresh weights or from a saved checkpoint.
 
 The charts show training loss, reference loss, throughput, and peak memory. The reference sample also remains in the training file.
 
@@ -53,6 +57,8 @@ Export the complete dataset. Then train the recommended Qwen 3 4B model for one 
 ```bash
 ./.venv/bin/python twin/export.py
 ./.venv/bin/python twin/train.py --model-key qwen3-capable --complete
+./.venv/bin/python twin/train.py --model-key qwen3-capable --complete --iters 2000
+./.venv/bin/python twin/train.py --model-key qwen3-capable --iters 500 --resume qwen3-capable/20260816-160000-ab12cd34ef56-2000/latest
 ```
 
 To train as a contact, pass a phone number or email:
@@ -67,6 +73,7 @@ Start an interactive chat with the Qwen 3 4B adapter.
 ```bash
 ./.venv/bin/python twin/chat.py --model-key qwen3-capable
 ./.venv/bin/python twin/chat.py --model-key qwen3-capable --person +15555550100
+./.venv/bin/python twin/chat.py --checkpoint qwen3-capable/20260816-160000-ab12cd34ef56-2000/latest
 ```
 
 Use `--once` for one reply.

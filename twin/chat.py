@@ -44,6 +44,10 @@ def main():
     parser.add_argument("--model-key", choices=MODELS, default=DEFAULT_MODEL)
     parser.add_argument("--model", help="Custom MLX model repository or local path")
     parser.add_argument("--adapter", help="Custom adapter directory")
+    parser.add_argument(
+        "--checkpoint",
+        help="Checkpoint id from the Twin page, like qwen3-capable/20260816-160000-ab12cd34ef56-12400/latest",
+    )
     parser.add_argument("--once", metavar="TEXT", help="One prompt, then exit")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument(
@@ -60,9 +64,19 @@ def main():
         sys.exit(str(e))
 
     config = model_config(args.model_key)
+    adapter = args.adapter
+    if not adapter and args.checkpoint:
+        from twin.train import load_dir_for, resolve_checkpoint
+
+        try:
+            ckpt = resolve_checkpoint(args.checkpoint, person_id)
+        except ValueError as e:
+            sys.exit(str(e))
+        adapter = load_dir_for(ckpt["path"], ckpt["step"])
+        config = model_config(ckpt["model"])
     model, tokenizer = load_model(
         args.model or config["repo"],
-        args.adapter or resolved_adapter_dir(args.model_key, person_id),
+        adapter or resolved_adapter_dir(args.model_key, person_id),
     )
     messages = [{"role": "system", "content": system_for(subject["name"])}]
 

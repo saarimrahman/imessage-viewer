@@ -31,7 +31,21 @@ from twin.job import (
     stop_train,
     chat as twin_chat,
 )
-from twin.train import DEFAULT_MODEL, MODELS, adapter_dir, steps_for_examples, train_command
+from twin.train import (
+    DEFAULT_MODEL,
+    MODELS,
+    adapter_dir,
+    checkpoint_id,
+    hash_train_file,
+    has_adapter,
+    list_adapter_runs,
+    make_run_id,
+    parse_checkpoint_id,
+    save_every_for,
+    steps_for_examples,
+    train_command,
+    write_run_metadata,
+)
 from render import NAV, render_twin
 
 
@@ -222,6 +236,7 @@ class TwinJobTest(unittest.TestCase):
             "phase", "detail", "iter", "iters", "examples", "busy", "has_adapter",
             "mlx", "metrics", "models", "eta_seconds", "elapsed_seconds",
             "phase_seconds", "step_seconds", "runs", "person", "person_name",
+            "adapter_runs", "run_id", "data_hash",
         ):
             self.assertIn(key, s)
         self.assertEqual(s["person"], "me")
@@ -229,6 +244,7 @@ class TwinJobTest(unittest.TestCase):
         self.assertIsInstance(s["has_adapter"], bool)
         self.assertIsInstance(s["mlx"], bool)
         self.assertIsInstance(s["runs"], list)
+        self.assertIsInstance(s["adapter_runs"], list)
         self.assertEqual(len(s["step_seconds"]), 3)
 
     def test_brief_snapshot_skips_heavy_fields(self):
@@ -236,6 +252,7 @@ class TwinJobTest(unittest.TestCase):
         self.assertNotIn("metrics", s)
         self.assertNotIn("models", s)
         self.assertNotIn("runs", s)
+        self.assertNotIn("adapter_runs", s)
         self.assertIn("busy", s)
         self.assertIn("eta_seconds", s)
 
@@ -243,6 +260,19 @@ class TwinJobTest(unittest.TestCase):
         ok, err = start_train(run="forever")
         self.assertFalse(ok)
         self.assertIn("run", err)
+
+    def test_rejects_invalid_step_counts(self):
+        ok, err = start_train(iters=0)
+        self.assertFalse(ok)
+        self.assertIn("steps", err)
+        ok, err = start_train(iters="nope")
+        self.assertFalse(ok)
+        self.assertIn("steps", err)
+
+    def test_rejects_a_malformed_resume_checkpoint(self):
+        ok, err = start_train(resume_from="not-a-checkpoint")
+        self.assertFalse(ok)
+        self.assertIn("Checkpoint", err)
 
     def test_rejects_an_unknown_person_without_starting(self):
         ok, err = start_train(person_id="not-a-contact")
@@ -359,6 +389,96 @@ class TwinModelTest(unittest.TestCase):
         self.assertIn("--mask-prompt", cmd)
         self.assertEqual(cmd[cmd.index("--steps-per-report") + 1], "5")
         self.assertEqual(cmd[cmd.index("--steps-per-eval") + 1], "20")
+        self.assertEqual(cmd[cmd.index("--save-every") + 1], "50")
+
+    def test_training_command_can_resume_from_weights(self):
+        cmd = train_command(
+            "model", "data", "adapter", 200,
+            save_every=25,
+            resume_adapter_file="/tmp/adapters.safetensors",
+        )
+        self.assertEqual(cmd[cmd.index("--save-every") + 1], "25")
+        self.assertEqual(cmd[cmd.index("--resume-adapter-file") + 1], "/tmp/adapters.safetensors")
+
+    def test_long_runs_save_periodic_checkpoints(self):
+        self.assertEqual(save_every_for(30), 30)
+        self.assertEqual(save_every_for(20000), 1000)
+
+
+class TwinAdapterRunTest(unittest.TestCase):
+    def test_run_ids_include_time_hash_and_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = make_run_id(1_724_000_000, "abc123def456", 12400, tmp)
+        self.assertIn("abc123de", run_id)
+        self.assertTrue(run_id.endswith("-12400"))
+        self.assertRegex(run_id, r"^\d{8}-\d{6}-abc123def456-12400$")
+
+    def test_run_ids_do_not_reuse_an_existing_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = make_run_id(1_724_000_000, "abc123def456", 10, tmp)
+            os.mkdir(os.path.join(tmp, first))
+            second = make_run_id(1_724_000_000, "abc123def456", 10, tmp)
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.endswith("-2"))
+
+    def test_checkpoint_ids_round_trip(self):
+        value = checkpoint_id("qwen3-capable", "20260816-160000-ab12cd34ef56-500", "latest")
+        model, run_id, step = parse_checkpoint_id(value)
+        self.assertEqual(model, "qwen3-capable")
+        self.assertEqual(run_id, "20260816-160000-ab12cd34ef56-500")
+        self.assertEqual(step, "latest")
+
+    def test_new_runs_do_not_overwrite_an_existing_adapter(self):
+        import twin.train as train
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(train, "TWIN_DIR", tmp):
+                root = adapter_dir("qwen3-capable")
+                os.makedirs(root, exist_ok=True)
+                legacy = os.path.join(root, "adapters.safetensors")
+                with open(legacy, "w", encoding="utf-8") as f:
+                    f.write("old")
+                newer = os.path.join(root, "20260816-160000-ab12cd34ef56-80")
+                os.makedirs(newer)
+                with open(os.path.join(newer, "adapters.safetensors"), "w", encoding="utf-8") as f:
+                    f.write("new")
+                with open(os.path.join(newer, "0000080_adapters.safetensors"), "w", encoding="utf-8") as f:
+                    f.write("ckpt")
+                write_run_metadata(
+                    newer,
+                    {
+                        "model": "qwen3-capable",
+                        "run_id": "20260816-160000-ab12cd34ef56-80",
+                        "created_at": 1_724_000_100,
+                        "data_hash": "ab12cd34ef56",
+                        "iters": 80,
+                        "examples": 40,
+                        "run": "complete",
+                        "status": "ready",
+                    },
+                )
+                self.assertTrue(has_adapter("qwen3-capable"))
+                runs = list_adapter_runs("me", "qwen3-capable")
+                by_id = {row["run_id"]: row for row in runs}
+                self.assertEqual(len(runs), 2)
+                self.assertIn("legacy", by_id)
+                self.assertIn("20260816-160000-ab12cd34ef56-80", by_id)
+                self.assertEqual(by_id["20260816-160000-ab12cd34ef56-80"]["data_hash"], "ab12cd34ef56")
+                self.assertEqual(by_id["20260816-160000-ab12cd34ef56-80"]["checkpoints"][0]["step"], "latest")
+                with open(legacy, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "old")
+
+    def test_train_file_hash_changes_with_the_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "train.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"a":1}\n')
+            first = hash_train_file(tmp)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write('{"a":2}\n')
+            second = hash_train_file(tmp)
+        self.assertEqual(len(first), 12)
+        self.assertNotEqual(first, second)
 
 
 class TwinPageTest(unittest.TestCase):
@@ -400,6 +520,9 @@ class TwinPageTest(unittest.TestCase):
         self.assertIn('id="twinChatSelect"', html)
         self.assertIn('id="twinChatPicker"', html)
         self.assertIn('name="twinchat"', html)
+        self.assertIn('id="twinIters"', html)
+        self.assertIn('id="twinResume"', html)
+        self.assertIn("Fresh weights", html)
         self.assertIn('href="#audit"', html)
         self.assertIn('data-tab="audit"', html)
         self.assertNotIn('id="twinPanelSignals"', html)
@@ -451,6 +574,28 @@ class TwinPageTest(unittest.TestCase):
             "phase_seconds": {},
             "step_seconds": [0, 0, 0],
             "runs": [],
+            "adapter_runs": [
+                {
+                    "id": "qwen3-capable/20260816-160000-ab12cd34ef56-80",
+                    "model": "qwen3-capable",
+                    "run_id": "20260816-160000-ab12cd34ef56-80",
+                    "name": "Qwen 3 Capable",
+                    "params": "4B",
+                    "created_at": 1_724_000_000,
+                    "data_hash": "ab12cd34ef56",
+                    "iters": 80,
+                    "examples": 40,
+                    "run": "complete",
+                    "resume_from": "",
+                    "checkpoints": [
+                        {
+                            "id": "qwen3-capable/20260816-160000-ab12cd34ef56-80/latest",
+                            "step": "latest",
+                            "step_n": 80,
+                        }
+                    ],
+                }
+            ],
         }
         with patch("twin.job.snapshot", return_value=fake):
             html = render_twin()
@@ -458,6 +603,7 @@ class TwinPageTest(unittest.TestCase):
         chat_html = html[start:html.index("</select>", start)]
         self.assertIn("qwen3-capable", chat_html)
         self.assertIn("Qwen 3 Capable", chat_html)
+        self.assertIn("ab12cd34", chat_html)
         self.assertNotIn("qwen3-compact", chat_html)
         self.assertNotIn("Qwen 3 Compact UNIQUE", chat_html)
         self.assertNotIn('id="twinChatPicker" hidden', html)
