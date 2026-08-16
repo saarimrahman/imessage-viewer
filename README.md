@@ -6,7 +6,7 @@ Nothing ever leaves your Mac. There is no cloud, no account, and no telemetry. A
 
 The app reads your Messages database (`~/Library/Messages/chat.db`) and Contacts, and stores local indexes in `.cache/` (excluded from Git).
 
-### Allow Access to Messages
+## Allow Access to Messages
 
 macOS requires **Full Disk Access** to read Messages.
 
