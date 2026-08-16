@@ -133,15 +133,21 @@ NAV = (
     ("/media", "Photos", "photos"),
     ("/search", "Search", "search"),
     ("/stats", "Stats", "stats"),
+    ("/twin", "Twin", "twin"),
 )
 
 
-def nav_html(active):
-    links = "".join(
-        f'<a class="nav-link{" is-active" if key == active else ""}" href="{href}">{label}</a>'
-        for href, label, key in NAV
-    )
-    return f'<nav class="nav">{links}</nav>'
+def nav_html(active, twin_busy=False):
+    links = []
+    for href, label, key in NAV:
+        classes = "nav-link"
+        if key == active:
+            classes += " is-active"
+        if key == "twin" and twin_busy:
+            classes += " is-training"
+        dot = '<span class="nav-dot" aria-hidden="true"></span>' if key == "twin" else ""
+        links.append(f'<a class="{classes}" href="{href}">{label}{dot}</a>')
+    return f'<nav class="nav">{"".join(links)}</nav>'
 
 
 # Runs in the head so the theme and the tile size are set before the first
@@ -200,9 +206,26 @@ def db_banner_html():
 </div>"""
 
 
+def twin_chip_html(activity):
+    if not activity.get("busy"):
+        return ""
+    from twin.job import activity_label
+
+    return (
+        f'<a class="twin-chip" id="twinChip" href="/twin#model">'
+        f'{html.escape(activity_label(activity))}</a>'
+    )
+
+
 def page(title, body, *, active="chats", header_left=None, header_right="", body_class="", scripts="", chat_id=None):
+    try:
+        from twin.job import snapshot as twin_pulse
+
+        activity = twin_pulse(brief=True)
+    except Exception:
+        activity = {"busy": False}
     left = header_left if header_left is not None else (
-        f'<a class="brand" href="/">Messages</a>{nav_html(active)}'
+        f'<a class="brand" href="/">Messages</a>{nav_html(active, activity.get("busy"))}'
     )
     data_chat = f' data-chat-id="{chat_id}"' if chat_id else ""
     return f"""<!doctype html>
@@ -218,7 +241,7 @@ def page(title, body, *, active="chats", header_left=None, header_right="", body
 {db_banner_html()}
 <header class="topbar">
 <div class="topbar-left">{left}</div>
-<div class="topbar-right">{header_right}</div>
+<div class="topbar-right">{twin_chip_html(activity)}{header_right}</div>
 {THEME_TOGGLE}
 </header>
 {body}
@@ -1942,6 +1965,195 @@ Sorted by the month they held the largest share, so the list reads top to bottom
 {fell_off_html}
 </main>"""
     return page("Stats", body, active="stats")
+
+
+def render_twin():
+    from twin.job import snapshot
+
+    s = snapshot()
+    train_dis = " disabled" if (not s["mlx"] or s["busy"]) else ""
+    select_dis = " disabled" if s["busy"] else ""
+    selected_model = s.get("model") or "qwen3-capable"
+    selected_info = next(
+        (m for m in s["models"] if m["key"] == selected_model),
+        s["models"][0],
+    )
+    selected_ready = selected_info["has_adapter"]
+    send_dis = " disabled" if (not selected_ready or s["busy"]) else ""
+    model_groups = {}
+    for model in s["models"]:
+        suffix = " · trained" if model["has_adapter"] else ""
+        selected = " selected" if model["key"] == selected_model else ""
+        option = (
+            f'<option value="{html.escape(model["key"])}"{selected}>'
+            f'{html.escape(model["name"])} — {html.escape(model["params"])} · '
+            f'{html.escape(model["download"])}{suffix}</option>'
+        )
+        model_groups.setdefault(model["category"], []).append(option)
+    model_options = "".join(
+        f'<optgroup label="{html.escape(category)}">{"".join(options)}</optgroup>'
+        for category, options in model_groups.items()
+    )
+    model_badges = "".join(
+        (
+            (
+            '<span class="twin-recommended" id="twinModelRecommended">Recommended</span>'
+            if selected_info.get("recommended")
+            else '<span class="twin-recommended" id="twinModelRecommended" hidden>Recommended</span>'
+            ),
+            (
+            '<span class="twin-downloaded" id="twinModelDownloaded">Downloaded</span>'
+            if selected_info["cached"]
+            else '<span class="twin-downloaded" id="twinModelDownloaded" hidden>Downloaded</span>'
+            ),
+            (
+            '<span class="twin-trained" id="twinModelTrained">Trained</span>'
+            if selected_info["has_adapter"]
+            else '<span class="twin-trained" id="twinModelTrained" hidden>Trained</span>'
+            ),
+        )
+    )
+    if not s["mlx"]:
+        hint = (
+            "Install MLX training support in this app's virtualenv, then restart the server:"
+            "<pre>./.venv/bin/python -m pip install -r twin/requirements.txt</pre>"
+        )
+    else:
+        hint = (
+            "Quick proves the loop on a small recent slice. Complete scans every chat, "
+            "creates real context variants, and makes one pass through the full dataset."
+        )
+    if s["busy"] or s["phase"] in ("error", "cancelled"):
+        default_tab = "model"
+    elif selected_ready:
+        default_tab = "chat"
+    else:
+        default_tab = "audit"
+    busy_cls = " is-busy" if s["busy"] else ""
+    metrics_hidden = "" if (s["busy"] or s["metrics"] or s["phase"] in ("error", "cancelled")) else " hidden"
+
+    def tab_state(name):
+        on = name == default_tab
+        return f'aria-selected="{"true" if on else "false"}"'
+
+    def panel_hidden(name):
+        return "" if name == default_tab else " hidden"
+
+    return page(
+        "Twin",
+        f"""<main class="page twin-page{busy_cls}" id="twinPage" data-tab="{default_tab}">
+<header class="twin-hero">
+<div class="twin-hero-copy">
+<h1 class="twin-title">Twin</h1>
+<p class="twin-lede">Fine-tune a private local model on the way you actually text. Your messages and adapter never leave this Mac.</p>
+</div>
+<div class="twin-tabs" id="twinTabs" role="tablist" aria-label="Twin">
+<a class="twin-tab" role="tab" id="twinTabAudit" href="#audit" data-tab="audit" aria-controls="twinPanelAudit" {tab_state("audit")}>Audit</a>
+<a class="twin-tab" role="tab" id="twinTabModel" href="#model" data-tab="model" aria-controls="twinPanelModel" {tab_state("model")}>Model<span class="twin-tab-dot" aria-hidden="true"></span></a>
+<a class="twin-tab" role="tab" id="twinTabChat" href="#chat" data-tab="chat" aria-controls="twinPanelChat" {tab_state("chat")}>Chat</a>
+</div>
+</header>
+
+<div class="twin-panels">
+<section class="twin-panel twin-panel-audit" id="twinPanelAudit" role="tabpanel" data-tab="audit" aria-labelledby="twinDataTitle"{panel_hidden("audit")}>
+<div class="twin-data card card-pad">
+<div class="twin-section-head">
+<div><h2 id="twinDataTitle">Your training material</h2></div>
+<p class="twin-section-note" id="twinDataNote">Inspecting the archive…</p>
+</div>
+<div class="twin-data-grid" id="twinDataGrid">
+<div><strong data-stat="sent_texts">—</strong><span>sent texts</span></div>
+<div><strong data-stat="direct_chats">—</strong><span>direct chats</span></div>
+<div><strong data-stat="group_chats">—</strong><span>group chats</span></div>
+<div><strong data-stat="attachments_only">—</strong><span>media-only, skipped</span></div>
+</div>
+<p class="twin-data-copy">Every non-empty text you sent becomes a target—even “k”, conversation openers, consecutive bubbles, old messages, and group-chat replies. Media without text cannot teach a language model and is counted separately.</p>
+</div>
+</section>
+
+<section class="twin-panel twin-panel-model" id="twinPanelModel" role="tabpanel" data-tab="model" aria-labelledby="twinModelTitle"{panel_hidden("model")}>
+<div class="twin-train card card-pad">
+<div class="twin-section-head">
+<div><h2 id="twinModelTitle">Choose the brain</h2></div>
+<p class="twin-section-note">Vetted 4-bit MLX chat models up to 8B. Weights download only when you train or chat.</p>
+</div>
+<div class="twin-model-picker" id="twinModels">
+<label class="twin-model-label" for="twinModelSelect">Model</label>
+<div class="twin-select-wrap">
+<select class="twin-model-select" id="twinModelSelect" name="twinmodel"{select_dis}>{model_options}</select>
+<span class="twin-select-arrow" aria-hidden="true">⌄</span>
+</div>
+<article class="twin-model-summary" id="twinModelSummary">
+<div class="twin-model-head"><strong id="twinModelName">{html.escape(selected_info['name'])}</strong><span>{model_badges}</span></div>
+<p class="twin-model-size" id="twinModelMeta">{html.escape(selected_info['publisher'])} · {html.escape(selected_info['params'])} parameters · {html.escape(selected_info['download'])} download</p>
+<p class="twin-model-copy" id="twinModelCopy">{html.escape(selected_info['description'])}</p>
+<p class="twin-model-memory" id="twinModelMemory">{html.escape(selected_info['memory'])}</p>
+</article>
+</div>
+<div class="twin-launch">
+<div>
+<p class="twin-eyebrow">Train</p>
+<div class="seg" id="twinRun">
+<label class="seg-btn"><input type="radio" name="twinrun" value="quick"> Quick</label>
+<label class="seg-btn"><input type="radio" name="twinrun" value="complete" checked> Complete</label>
+</div>
+</div>
+<button type="button" class="btn btn-primary twin-train-btn" id="twinTrain"{train_dis}>Train locally</button>
+</div>
+<div class="twin-hint muted">{hint}</div>
+</div>
+<div class="twin-metrics" id="twinMetrics"{metrics_hidden}>
+<div class="twin-section-head">
+<div><h2 id="twinMetricsTitle">How the model is learning</h2></div>
+<p class="twin-section-note">Train and reference loss on a stable sample that stays in training, so every text contributes.</p>
+</div>
+<div class="twin-chart-grid">
+<figure class="card card-pad twin-chart"><figcaption><strong>Loss</strong><span>Lower is better</span></figcaption><svg id="twinLossChart" viewBox="0 0 520 190" role="img" aria-label="Training and reference loss"><g class="chart-grid"></g><path class="chart-line chart-train"></path><path class="chart-line chart-reference"></path><g class="chart-labels"></g></svg><div class="twin-legend"><span class="is-train">Train</span><span class="is-reference">Reference</span></div></figure>
+<figure class="card card-pad twin-chart"><figcaption><strong>Throughput</strong><span>Tokens per second</span></figcaption><svg id="twinSpeedChart" viewBox="0 0 520 190" role="img" aria-label="Training throughput"><g class="chart-grid"></g><path class="chart-line chart-speed"></path><g class="chart-labels"></g></svg><div class="twin-chart-summary"><span id="twinPeakSpeed">Waiting for training</span><span id="twinPeakMemory"></span></div></figure>
+</div>
+</div>
+<div class="twin-live" id="twinLive">
+<div class="twin-live-head">
+<p class="twin-status" id="twinStatus" aria-live="polite"></p>
+<p class="twin-progress-meta" id="twinProgressMeta"></p>
+<button type="button" class="btn btn-ghost twin-stop" id="twinStop" hidden>Stop</button>
+</div>
+<div class="twin-progress" id="twinProgress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+<ol class="twin-steps" id="twinSteps">
+<li data-phase="inspect"><a href="#audit"><span>1</span><div><strong>Audit archive</strong><small>Count usable text without exposing it.</small><time class="twin-step-time"></time></div></a></li>
+<li data-phase="export"><a href="#model"><span>2</span><div><strong>Build pairs</strong><small>Keep context and derive short real variants.</small><time class="twin-step-time"></time></div></a></li>
+<li data-phase="train"><a href="#model"><span>3</span><div><strong>Fit adapter</strong><small>Download weights if needed, then train on your JSONL.</small><time class="twin-step-time"></time></div></a></li>
+<li data-phase="chat"><a href="#chat"><span>4</span><div><strong>Text the twin</strong><small>Opens automatically when the adapter is ready.</small><time class="twin-step-time"></time></div></a></li>
+</ol>
+</div>
+<div class="twin-runs card card-pad" id="twinRuns" hidden>
+<div class="twin-section-head">
+<div>
+<p class="twin-eyebrow">History</p>
+<h2 id="twinRunsTitle">Training attempts</h2>
+</div>
+<p class="twin-section-note">Latest first. Compare duration, data size, and loss across attempts.</p>
+</div>
+<ol id="twinRunList"></ol>
+</div>
+</section>
+
+<section class="twin-panel twin-panel-chat" id="twinPanelChat" role="tabpanel" data-tab="chat" aria-labelledby="twinChatTitle"{panel_hidden("chat")}>
+<div class="twin-chat-head">
+<div><h2 id="twinChatTitle">Text your twin</h2></div>
+<p class="twin-section-note" id="twinChatModel">Select a trained model in Model.</p>
+</div>
+<div class="twin-thread" id="twinThread"></div>
+<form class="twin-compose" id="twinCompose">
+<input class="field" id="twinInput" type="text" maxlength="500" autocomplete="off" placeholder="Text the twin…"{send_dis}>
+<button class="btn btn-primary" type="submit" id="twinSend"{send_dis}>Send</button>
+</form>
+</section>
+</div>
+</main>""",
+        active="twin",
+        body_class="twinpage",
+    )
 
 
 def render_db_error(detail):

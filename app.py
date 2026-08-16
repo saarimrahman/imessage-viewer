@@ -59,7 +59,16 @@ from render import (
     render_message_blocks,
     render_search,
     render_stats,
+    render_twin,
     is_time_break,
+)
+from twin.job import (
+    TwinError,
+    chat as twin_chat,
+    inspect_data as twin_inspect_data,
+    snapshot as twin_snapshot,
+    start_train,
+    stop_train,
 )
 from search import ensure_indexes, kick_search_index
 
@@ -114,6 +123,62 @@ class Handler(BaseHTTPRequestHandler):
         except DbUnavailable as e:
             self._send_html(render_db_error(str(e)), status=503)
 
+    def do_POST(self):
+        try:
+            self._dispatch_post()
+        except DbUnavailable as e:
+            self._send_json({"error": str(e)}, status=503)
+        except json.JSONDecodeError:
+            self._send_json({"error": "bad json"}, status=400)
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n < 0 or n > 100_000:
+            raise json.JSONDecodeError("too large", "", 0)
+        raw = self.rfile.read(n) if n else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
+    def _dispatch_post(self):
+        parsed = urlparse(self.path)
+        parts = [p for p in parsed.path.split("/") if p]
+        body = self._read_json()
+        if not isinstance(body, dict):
+            self._send_json({"error": "bad json"}, status=400)
+            return
+        if parts == ["twin", "train"]:
+            run = body.get("run") or "complete"
+            model = body.get("model") or "balanced"
+            ok, err = start_train(run=run, model_key=model)
+            if not ok:
+                self._send_json({"error": err, **twin_snapshot()}, status=409)
+                return
+            self._send_json(twin_snapshot())
+        elif parts == ["twin", "stop"]:
+            ok, err = stop_train()
+            if not ok:
+                self._send_json({"error": err, **twin_snapshot()}, status=409)
+                return
+            self._send_json(twin_snapshot())
+        elif parts == ["twin", "chat"]:
+            history = body.get("history") or []
+            if not isinstance(history, list):
+                history = []
+            try:
+                reply = twin_chat(
+                    body.get("text") or "",
+                    history,
+                    model_key=body.get("model") or "balanced",
+                )
+            except TwinError as e:
+                self._send_json({"error": str(e)}, status=409)
+                return
+            self._send_json({"reply": reply})
+        else:
+            self._send_error(404)
+
     def _dispatch(self):
         parsed = urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
@@ -129,6 +194,13 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_static(parts[1])
         elif parts[0] == "stats" and len(parts) == 1:
             self._send_html(render_stats())
+        elif parts[0] == "twin" and len(parts) == 1:
+            self._send_html(render_twin())
+        elif parts[0] == "twin" and len(parts) == 2 and parts[1] == "status":
+            brief = qs.get("brief", [""])[0] in ("1", "true")
+            self._send_json(twin_snapshot(brief=brief))
+        elif parts[0] == "twin" and len(parts) == 2 and parts[1] == "data":
+            self._send_json(twin_inspect_data())
         elif parts[0] == "search" and len(parts) == 1:
             query = qs.get("q", [None])[0]
             self._send_html(render_search(query))
@@ -253,9 +325,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_json(self, obj):
+    def _send_json(self, obj, status=200):
         data = json.dumps(obj).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
