@@ -716,6 +716,23 @@ class TwinAdapterRunTest(unittest.TestCase):
         self.assertEqual(run_id, "20260816-160000-ab12cd34ef56-500")
         self.assertEqual(step, "latest")
 
+    def test_has_adapter_is_false_without_weights(self):
+        import twin.train as train
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(train, "TWIN_DIR", tmp):
+                self.assertFalse(has_adapter("qwen3-capable"))
+                self.assertFalse(has_adapter("compact"))
+                root = adapter_dir("qwen3-capable")
+                os.makedirs(root)
+                with open(os.path.join(root, "adapter_config.json"), "w", encoding="utf-8") as f:
+                    f.write("{}")
+                self.assertFalse(has_adapter("qwen3-capable"))
+                with open(os.path.join(root, "adapters.safetensors"), "w", encoding="utf-8") as f:
+                    f.write("weights")
+                self.assertTrue(has_adapter("qwen3-capable"))
+                self.assertFalse(has_adapter("compact"))
+
     def test_new_runs_do_not_overwrite_an_existing_adapter(self):
         import twin.train as train
 

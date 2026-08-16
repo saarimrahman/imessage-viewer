@@ -355,7 +355,7 @@ def checkpoint_steps(path):
 def has_adapter(model_key="compact", adapter=None, person_id="me"):
     if adapter is not None:
         return has_weights(adapter)
-    return bool(iter_run_paths(model_key, person_id))
+    return any(iter_run_paths(model_key, person_id))
 
 
 def iter_run_paths(model_key, person_id="me"):
