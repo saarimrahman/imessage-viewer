@@ -947,25 +947,109 @@
       return node;
     }
 
+    function chartXY(point, key, width, height, maxX, maxY) {
+      return [
+        34 + (point.iter / Math.max(1, maxX)) * (width - 46),
+        10 + (1 - point[key] / Math.max(0.001, maxY)) * (height - 36),
+      ];
+    }
+
     function chartPath(points, key, width, height, maxX, maxY) {
-      const filtered = points.filter((point) => Number.isFinite(point[key]));
-      return filtered.map((point, index) => {
-        const x = 34 + (point.iter / Math.max(1, maxX)) * (width - 46);
-        const y = 10 + (1 - point[key] / Math.max(0.001, maxY)) * (height - 36);
+      return points.filter((point) => Number.isFinite(point[key])).map((point, index) => {
+        const [x, y] = chartXY(point, key, width, height, maxX, maxY);
         return (index ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
       }).join(" ");
+    }
+
+    function chartKind(key) {
+      if (key === "reference_loss") return "is-reference";
+      if (key === "tokens_sec") return "is-speed";
+      return "is-train";
+    }
+
+    function chartValueLabel(key, value) {
+      if (key === "train_loss") return "train " + formatLoss(value);
+      if (key === "reference_loss") return "val " + formatLoss(value);
+      if (key === "tokens_sec") {
+        return value.toLocaleString(undefined, { maximumFractionDigits: 0 }) + " tok/s";
+      }
+      if (key === "memory_gb") return value.toFixed(1) + " GB";
+      return String(value);
+    }
+
+    function hideChartHover(svg) {
+      const wrap = svg.closest(".twin-chart-plot");
+      const tip = wrap && wrap.querySelector(".twin-chart-tip");
+      const hover = svg.querySelector(".chart-hover");
+      if (tip) tip.style.opacity = "0";
+      if (hover) hover.replaceChildren();
+      svg._twinHoverX = null;
+    }
+
+    function showChartHover(svg, clientX) {
+      const state = svg._twinChart;
+      const wrap = svg.closest(".twin-chart-plot");
+      const tip = wrap && wrap.querySelector(".twin-chart-tip");
+      const hover = svg.querySelector(".chart-hover");
+      if (!state || !state.hits.length || !wrap) {
+        hideChartHover(svg);
+        return;
+      }
+      const box = svg.getBoundingClientRect();
+      const wbox = wrap.getBoundingClientRect();
+      const x = (clientX - box.left) * (state.width / Math.max(1, box.width));
+      if (x < 34 || x > state.width - 12) {
+        hideChartHover(svg);
+        return;
+      }
+      let best = state.hits[0];
+      let bestDist = Math.abs(best.x - x);
+      state.hits.forEach((hit) => {
+        const dist = Math.abs(hit.x - x);
+        if (dist < bestDist) {
+          best = hit;
+          bestDist = dist;
+        }
+      });
+      svg._twinHoverX = clientX;
+      if (hover) {
+        hover.replaceChildren(...best.dots.map((dot) => svgNode("circle", {
+          cx: dot.x.toFixed(1),
+          cy: dot.y.toFixed(1),
+          r: "4.5",
+          class: "chart-hover-dot " + dot.kind,
+        })));
+      }
+      if (tip) {
+        tip.textContent = best.label;
+        tip.style.left = (box.left - wbox.left + best.x * box.width / state.width) + "px";
+        tip.style.top = (box.top - wbox.top + best.topY * box.height / state.height) + "px";
+        tip.style.opacity = "1";
+      }
+    }
+
+    function bindChartHover(svg) {
+      if (svg.dataset.hoverBound) return;
+      svg.dataset.hoverBound = "1";
+      svg.addEventListener("pointermove", (e) => showChartHover(svg, e.clientX));
+      svg.addEventListener("pointerleave", () => hideChartHover(svg));
     }
 
     function drawChart(svg, metrics, keys, maxY) {
       const width = 520;
       const height = 190;
+      const hoverX = svg._twinHoverX;
       const maxX = Math.max(1, ...metrics.map((point) => point.iter || 0));
       const values = metrics.flatMap((point) => keys.map((key) => point[key])).filter(Number.isFinite);
       const yTop = maxY || Math.max(1, ...values) * 1.12;
       const grid = svg.querySelector(".chart-grid");
       const labels = svg.querySelector(".chart-labels");
+      const dots = svg.querySelector(".chart-dots");
+      const hover = svg.querySelector(".chart-hover");
       grid.replaceChildren();
       labels.replaceChildren();
+      if (dots) dots.replaceChildren();
+      if (hover && hoverX == null) hover.replaceChildren();
       for (let i = 0; i <= 3; i += 1) {
         const y = 10 + (i / 3) * (height - 36);
         grid.appendChild(svgNode("line", { x1: 34, y1: y, x2: width - 12, y2: y }));
@@ -973,10 +1057,41 @@
       }
       labels.appendChild(svgNode("text", { x: 34, y: height - 4 }, "0"));
       labels.appendChild(svgNode("text", { x: width - 12, y: height - 4, "text-anchor": "end" }, maxX.toLocaleString()));
+      const hits = [];
+      metrics.forEach((point) => {
+        const marks = [];
+        const parts = [];
+        keys.forEach((key) => {
+          if (!Number.isFinite(point[key])) return;
+          const [x, y] = chartXY(point, key, width, height, maxX, yTop);
+          marks.push({ x, y, kind: chartKind(key) });
+          parts.push(chartValueLabel(key, point[key]));
+        });
+        if (!marks.length) return;
+        hits.push({
+          x: marks[0].x,
+          topY: Math.min(...marks.map((mark) => mark.y)),
+          dots: marks,
+          label: "step " + Number(point.iter || 0).toLocaleString() + " · " + parts.join(" · "),
+        });
+      });
       keys.forEach((key, index) => {
         const path = svg.querySelectorAll(".chart-line")[index];
         if (path) path.setAttribute("d", chartPath(metrics, key, width, height, maxX, yTop));
+        if (!dots || !path || !path.classList.contains("chart-reference")) return;
+        metrics.filter((point) => Number.isFinite(point[key])).forEach((point) => {
+          const [x, y] = chartXY(point, key, width, height, maxX, yTop);
+          dots.appendChild(svgNode("circle", {
+            cx: x.toFixed(1),
+            cy: y.toFixed(1),
+            r: "3",
+            class: "chart-dot is-reference",
+          }));
+        });
       });
+      svg._twinChart = { width, height, hits };
+      bindChartHover(svg);
+      if (hoverX != null) showChartHover(svg, hoverX);
     }
 
     function latestMetric(metrics, key) {

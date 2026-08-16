@@ -1374,7 +1374,7 @@ html[data-mediasize="s"] .tile-dur { display: none; }
   position: absolute;
   pointer-events: none;
   background: var(--ink);
-  color: #fff;
+  color: var(--surface);
   font-size: 12px;
   font-weight: 600;
   padding: 6px 10px;
@@ -1382,6 +1382,7 @@ html[data-mediasize="s"] .tile-dur { display: none; }
   opacity: 0;
   transform: translate(-50%, -130%);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
   transition-property: opacity;
   transition-duration: 120ms;
 }
@@ -2723,17 +2724,26 @@ body.twinpage { background: var(--bg-chat); }
   letter-spacing: 0.03em;
   text-transform: uppercase;
 }
-.twin-chart { margin: 0; min-width: 0; }
+.twin-chart { margin: 0; min-width: 0; overflow: visible; }
 .twin-chart figcaption { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .twin-chart figcaption strong { font-size: 13px; }
 .twin-chart figcaption span { color: var(--muted); font-size: 10px; }
+.twin-chart-plot { position: relative; }
 .twin-chart svg { display: block; width: 100%; height: auto; margin-top: 8px; overflow: visible; }
+.chart-grid, .chart-labels { pointer-events: none; }
 .chart-grid line { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .chart-labels text { fill: var(--faint); font: 9px var(--font-ui); font-variant-numeric: tabular-nums; }
-.chart-line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.chart-line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; pointer-events: none; }
 .chart-train { stroke: var(--signal); }
 .chart-reference { stroke: var(--fade); stroke-dasharray: 4 4; }
+.chart-dot, .chart-hover { pointer-events: none; }
+.chart-dot { fill: var(--fade); stroke: var(--surface); stroke-width: 1.25; }
+.chart-hover-dot { fill: var(--signal); stroke: var(--surface); stroke-width: 2; }
+.chart-hover-dot.is-reference { fill: var(--fade); }
+.chart-hover-dot.is-speed { fill: #30a46c; }
+.chart-hitbox { fill: transparent; cursor: crosshair; }
 .chart-speed { stroke: #30a46c; }
+.twin-chart-tip { z-index: 2; }
 .twin-legend, .twin-chart-summary { display: flex; align-items: center; gap: 14px; min-height: 18px; color: var(--muted); font-size: 10px; }
 .twin-legend span::before { content: ""; display: inline-block; width: 14px; height: 2px; margin-right: 5px; vertical-align: 3px; background: var(--signal); }
 .twin-legend .is-reference::before { background: var(--fade); }
