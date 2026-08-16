@@ -11,7 +11,9 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,7 +39,60 @@ SYSTEM = (
     f"with {BUBBLE}."
 )
 OPENER_PROMPT = "Send a natural text in my voice to continue or open this conversation."
+MEDIA_MARK = "[attachment]"
+MAX_EXACT_TARGET = 4
+MAX_SHORT_TARGET = 2
+RECENCY_HALF_LIFE_NS = 365 * 24 * 60 * 60 * 1_000_000_000
+RECENCY_FLOOR = 0.15
+CHAT_TEMP = 0.5
+CHAT_TOP_P = 0.9
+MAX_BUBBLES = 4
+REPETITION_PENALTY = 1.15
 TWIN_DIR = os.path.join(CACHE_DIR, "twin")
+LOW_SIGNAL = {
+    "ok", "k", "kk", "okay", "ok.", "okay.",
+    "lol", "lmao", "haha", "ha", "hahaha",
+    "yeah", "yea", "yep", "yup", "yes", "ya",
+    "no", "nah", "nope",
+    "np", "ty", "thanks", "thank you",
+    "sure", "bet", "word", "nice", "cool", "true", "facts", "same",
+    "sounds good", "ok sounds good", "okay sounds good",
+    "omg", "wow",
+    "👍", "👌", "😂", "❤️", "💕", "🔥",
+}
+ARTIFACT_QUOTE_RE = re.compile(
+    r"(?is)^(Loved|Liked|Disliked|Laughed at|Emphasized|Questioned|"
+    r"Reacted(?: with \S+)?|Removed (?:a )?(?:like|love|laugh|emphasis|"
+    r"question mark|reaction))\s+[“\"'].+[”\"']$"
+)
+ARTIFACT_BARE_RE = re.compile(
+    r"(?is)^(Loved|Liked|Disliked|Laughed at|Emphasized|Questioned)\s+"
+    r"(an?|your|my)\s+\S+"
+)
+UNSENT_TEXT_RE = re.compile(
+    r"(?is)^(you )?unsent a message\.?$|^this message was (deleted|unsent)\.?$"
+)
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]\d{4}(?!\d)"
+)
+CARD_RE = re.compile(r"(?<!\d)(?:\d[ \-]*){13,19}(?!\d)")
+SECRET_RE = re.compile(
+    r"(?i)\b(?:password|passwd|passcode|pin|otp|2fa code|verification code|"
+    r"login code|auth code)\b[:\s#]*\S+"
+)
+ADDR_RE = re.compile(
+    r"\b\d{1,5}\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?\s+"
+    r"(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Ln|Lane|Dr|Drive|"
+    r"Ct|Court|Way|Hwy|Highway)\.?\b",
+    re.I,
+)
+CODE_MSG_RE = re.compile(r"^\d{4,8}$")
+URL_ONLY_RE = re.compile(r"(?i)^https?://\S+$")
+REDACTION_ONLY_RE = re.compile(
+    r"^(?:\[(?:phone|email|code|password|card|address)\](?:\s*<\|bubble\|>\s*)?)+$"
+)
+_TWIN_SELECT_SQL = None
 
 
 def person_id_for(handle):
@@ -63,15 +118,21 @@ def parse_person_arg(value):
     return pid
 
 
-def system_for(name=None):
+def system_for(name=None, peer=None):
     if not name or name == "You":
-        return SYSTEM
-    return (
-        f"You are {name}'s texting twin. Continue the conversation exactly as "
-        f"{name} would. Match their wording, capitalization, punctuation, emoji, "
-        "cadence, and typical length. Output only the message text. Separate "
-        f"consecutive iMessage bubbles with {BUBBLE}."
-    )
+        base = SYSTEM
+    else:
+        base = (
+            f"You are {name}'s texting twin. Continue the conversation exactly as "
+            f"{name} would. Match their wording, capitalization, punctuation, emoji, "
+            "cadence, and typical length. Output only the message text. Separate "
+            f"consecutive iMessage bubbles with {BUBBLE}."
+        )
+    if peer:
+        peer = " ".join(str(peer).split())[:80]
+        if peer:
+            base = f"{base} You are texting {peer}."
+    return base
 
 
 def opener_for(name=None):
@@ -86,6 +147,186 @@ def join_bubbles(parts):
 
 def split_bubbles(text):
     return [part.strip() for part in str(text or "").split(BUBBLE) if part.strip()]
+
+
+def clip_bubbles(text, max_bubbles=MAX_BUBBLES):
+    """Keep the first N bubbles so greedy decoding cannot loop on the delimiter."""
+    text = (text or "").strip()
+    parts = split_bubbles(text)
+    if len(parts) <= max_bubbles:
+        return text
+    return join_bubbles(parts[:max_bubbles])
+
+
+def is_artifact(text):
+    """True for tapback summaries, unsent notices, and similar non-reply text."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return bool(
+        ARTIFACT_QUOTE_RE.match(stripped)
+        or ARTIFACT_BARE_RE.match(stripped)
+        or UNSENT_TEXT_RE.match(stripped)
+    )
+
+
+def is_media_only(text):
+    parts = split_bubbles(text)
+    return bool(parts) and all(part == MEDIA_MARK for part in parts)
+
+
+def is_link_only(text):
+    body = (text or "").replace(BUBBLE, " ").strip()
+    return bool(URL_ONLY_RE.match(body))
+
+
+def is_low_signal(text):
+    stripped = (text or "").replace(BUBBLE, " ").strip()
+    if not stripped:
+        return True
+    if stripped in LOW_SIGNAL:
+        return True
+    norm = re.sub(r"[^\w\s]+", "", stripped.lower()).strip()
+    if norm in LOW_SIGNAL:
+        return True
+    words = stripped.split()
+    return len(words) <= 2 and len(stripped) <= 12
+
+
+def redact_text(text):
+    """Replace secrets and contact details. Keep ordinary chat wording."""
+    if not text:
+        return text
+    out = []
+    for part in str(text).split(BUBBLE):
+        piece = part
+        if CODE_MSG_RE.match(piece.strip()):
+            out.append("[code]")
+            continue
+        piece = EMAIL_RE.sub("[email]", piece)
+        piece = SECRET_RE.sub("[password]", piece)
+        piece = CARD_RE.sub("[card]", piece)
+        piece = PHONE_RE.sub("[phone]", piece)
+        piece = ADDR_RE.sub("[address]", piece)
+        out.append(piece)
+    return BUBBLE.join(out)
+
+
+def redact_messages(messages):
+    out = []
+    for message in messages:
+        if message.get("role") == "system":
+            out.append(message)
+            continue
+        out.append({**message, "content": redact_text(message.get("content") or "")})
+    return out
+
+
+def is_redaction_only(text):
+    compact = (text or "").strip()
+    return (not compact.replace(BUBBLE, "").strip()) or bool(REDACTION_ONLY_RE.match(compact))
+
+
+def recency_weight(date_ns, now_ns, half_life=RECENCY_HALF_LIFE_NS):
+    age = max(0, (now_ns or 0) - (date_ns or 0))
+    if half_life <= 0:
+        return 1.0
+    return 0.5 ** (age / half_life)
+
+
+def cap_duplicate_targets(examples, max_exact=MAX_EXACT_TARGET, max_short=MAX_SHORT_TARGET):
+    """Keep at most a few copies of any exact reply, fewer if it is an ack."""
+    groups = {}
+    order = []
+    for example in examples:
+        key = example.get("_reply") or ""
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(example)
+    kept = []
+    dropped = 0
+    for key in order:
+        rows = groups[key]
+        rows.sort(key=lambda row: row.get("_date") or 0, reverse=True)
+        limit = max_short if is_low_signal(key) else max_exact
+        kept.extend(rows[:limit])
+        dropped += max(0, len(rows) - limit)
+    kept.sort(key=lambda row: (row.get("_date") or 0, str(row.get("_id") or "")))
+    return kept, dropped
+
+
+def downsample_recency(examples, rng=None, floor=RECENCY_FLOOR):
+    """Keep recent train rows; keep older rows with decaying probability."""
+    if not examples:
+        return examples, 0
+    rng = rng or random.Random(0)
+    now = max(example.get("_date") or 0 for example in examples)
+    kept = []
+    dropped = 0
+    for example in examples:
+        keep_p = max(floor, recency_weight(example.get("_date") or 0, now))
+        if keep_p >= 1.0 or rng.random() <= keep_p:
+            kept.append(example)
+        else:
+            dropped += 1
+    if not kept or len(kept) < max(8, len(examples) // 5):
+        return examples, 0
+    return kept, dropped
+
+
+def target_concentration(examples, top_n=20):
+    replies = [example.get("_reply") or "" for example in examples]
+    n = len(replies)
+    if not n:
+        return {"unique_targets": 0, "top20_share": 0.0}
+    counts = Counter(replies)
+    top = sum(count for _, count in counts.most_common(top_n))
+    return {"unique_targets": len(counts), "top20_share": top / n}
+
+
+def peer_from_system(text):
+    marker = "You are texting "
+    if marker not in (text or ""):
+        return ""
+    return (text or "").split(marker, 1)[1].split(".", 1)[0].strip()
+
+
+def twin_msg_select(conn):
+    """Message select plus unsent and attachment flags when the columns exist."""
+    global _TWIN_SELECT_SQL
+    if _TWIN_SELECT_SQL is None:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(message)")}
+        unsent = "COALESCE(m.is_unsent, 0)" if "is_unsent" in cols else "0"
+        attach = (
+            "COALESCE(m.cache_has_attachments, 0)"
+            if "cache_has_attachments" in cols
+            else "0"
+        )
+        _TWIN_SELECT_SQL = (
+            "SELECT m.ROWID as id, m.guid, m.text, m.attributedBody, m.date, "
+            f"m.is_from_me, h.id as handle, {unsent} AS is_unsent, "
+            f"{attach} AS has_attachments "
+            "FROM message m "
+            "JOIN chat_message_join cmj ON cmj.message_id = m.ROWID "
+            "LEFT JOIN handle h ON h.ROWID = m.handle_id"
+        )
+    return _TWIN_SELECT_SQL
+
+
+def chat_peer_label(conn, chat_id, target_key=None):
+    """Contact card name for a 1:1 chat, or a generic label that is not a handle."""
+    if target_key is not None:
+        return "You"
+    row = conn.execute(
+        """SELECT h.id AS handle FROM chat_handle_join chj
+           JOIN handle h ON h.ROWID = chj.handle_id
+           WHERE chj.chat_id = ? LIMIT 1""",
+        [chat_id],
+    ).fetchone()
+    if not row:
+        return None
+    return resolve_contact(row["handle"]) or "this contact"
 
 
 def is_assistant_row(row, target_key=None):
@@ -424,7 +665,12 @@ def write_dataset(examples, out_dir, train=None, valid=None, test=None):
     write_jsonl(os.path.join(out_dir, "valid.jsonl"), [public_example(row) for row in (valid or [])])
     write_jsonl(os.path.join(out_dir, "test.jsonl"), [public_example(row) for row in (test or [])])
     retrieve_rows = [
-        {"query": row["_query"], "reply": row["_reply"]}
+        {
+            "query": row["_query"],
+            "reply": row["_reply"],
+            "peer": row.get("_peer") or "",
+            "date": row.get("_date") or 0,
+        }
         for row in (train or [])
         if row.get("_query") and row.get("_reply")
     ]
@@ -475,19 +721,27 @@ def fetch_pairs(conn, chat_id, per_chat=0, target_key=None):
         limit_sql = " LIMIT ?"
         params.append(per_chat)
     rows = conn.execute(
-        f"""{MSG_SELECT}
+        f"""{twin_msg_select(conn)}
             WHERE cmj.chat_id = ? AND {REACTION_EXCLUDE_SQL}
             ORDER BY m.date DESC, m.ROWID DESC{limit_sql}""",
         params,
     ).fetchall()
     pairs = []
     for row in reversed(rows):
+        if row["is_unsent"]:
+            continue
         text = message_text(row)
-        if text:
-            sender = "me" if row["is_from_me"] else (row["handle"] or "user")
-            pairs.append(
-                (is_assistant_row(row, target_key), text, row["date"], row["id"], sender)
-            )
+        if is_artifact(text or ""):
+            continue
+        if not text:
+            if row["has_attachments"]:
+                text = MEDIA_MARK
+            else:
+                continue
+        sender = "me" if row["is_from_me"] else (row["handle"] or "user")
+        pairs.append(
+            (is_assistant_row(row, target_key), text, row["date"], row["id"], sender)
+        )
     return pairs
 
 
@@ -537,6 +791,9 @@ def collect_examples(
     skipped_overflow = 0
     skipped_illegal = 0
     skipped_groups = 0
+    skipped_media = 0
+    skipped_link = 0
+    skipped_pii = 0
     sessions_n = 0
     seen_message_ids = set()
     allowed = None if include_groups else direct_chat_ids(conn)
@@ -553,15 +810,31 @@ def collect_examples(
             continue
         chats += 1
         sent_turns += len(sent)
-        sent_texts += sum(1 for pair in pairs if pair[0])
+        sent_texts += sum(1 for pair in pairs if pair[0] and pair[1] != MEDIA_MARK)
+        peer = None if include_groups else chat_peer_label(conn, chat_id, target_key)
         for session_i, session in enumerate(sessionize(turns)):
             sessions_n += 1
             sid = (chat_id, session_i)
             for i, turn in enumerate(session):
                 if turn["role"] == "assistant" and _context_window(session, i) is None:
                     opener_turns += 1
-            rows = examples_from_turns(session, system=system_for(name))
+            rows = examples_from_turns(session, system=system_for(name, peer=peer))
             for row in rows:
+                query = row.get("_query") or ""
+                reply = row.get("_reply") or ""
+                if is_media_only(query) or is_media_only(reply):
+                    skipped_media += 1
+                    continue
+                if is_link_only(reply):
+                    skipped_link += 1
+                    continue
+                row["messages"] = redact_messages(row["messages"])
+                row["_query"] = row["messages"][-2]["content"]
+                row["_reply"] = row["messages"][-1]["content"]
+                if is_redaction_only(row["_reply"]):
+                    skipped_pii += 1
+                    continue
+                row["_peer"] = peer or ""
                 fitted = fit_messages(
                     row["messages"],
                     tokenizer,
@@ -607,6 +880,9 @@ def collect_examples(
         "skipped_overflow": skipped_overflow,
         "skipped_illegal": skipped_illegal,
         "skipped_groups": skipped_groups,
+        "skipped_media": skipped_media,
+        "skipped_link": skipped_link,
+        "skipped_pii": skipped_pii,
         "examples": len(examples),
     }
 
@@ -713,6 +989,10 @@ def export_dataset(
             f"No text from {who} to export. Grant Full Disk Access if chat.db is blocked."
         )
     split = partition_examples(examples)
+    raw_train = list(split["train"])
+    concentration = target_concentration(raw_train)
+    split["train"], capped = cap_duplicate_targets(split["train"])
+    split["train"], recency_dropped = downsample_recency(split["train"])
     n_train, n_valid, n_test = write_dataset(
         examples, out_dir, train=split["train"], valid=split["valid"], test=split["test"]
     )
@@ -726,6 +1006,10 @@ def export_dataset(
         "max_seq_length": max_seq_length,
         "context_turns": CONTEXT_TURNS,
         "session_gap_hours": SESSION_GAP_NS / (60 * 60 * 1_000_000_000),
+        "unique_targets": concentration["unique_targets"],
+        "top20_share": concentration["top20_share"],
+        "capped_targets": capped,
+        "recency_dropped": recency_dropped,
     }
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "split.json"), "w", encoding="utf-8") as f:

@@ -592,6 +592,8 @@
     const metricsEl = document.getElementById("twinMetrics");
     const trainBtn = document.getElementById("twinTrain");
     const stopBtn = document.getElementById("twinStop");
+    const goChatBtn = document.getElementById("twinGoChat");
+    const readoutEl = document.getElementById("twinMetricReadout");
     const itersInput = document.getElementById("twinIters");
     const resumeSelect = document.getElementById("twinResume");
     const sendBtn = document.getElementById("twinSend");
@@ -977,6 +979,52 @@
       });
     }
 
+    function latestMetric(metrics, key) {
+      let value = null;
+      (metrics || []).forEach((point) => {
+        if (Number.isFinite(point[key])) value = point[key];
+      });
+      return value;
+    }
+
+    function formatRate(value) {
+      if (!Number.isFinite(value) || value <= 0) return "";
+      return value.toExponential(2).replace(/e\+?/, "e");
+    }
+
+    function readoutStat(label, value) {
+      if (!value) return null;
+      const wrap = document.createElement("div");
+      const dd = document.createElement("dd");
+      const dt = document.createElement("dt");
+      dd.textContent = value;
+      dt.textContent = label;
+      wrap.append(dd, dt);
+      return wrap;
+    }
+
+    function drawReadout(metrics) {
+      if (!readoutEl) return;
+      const train = latestMetric(metrics, "train_loss");
+      const val = latestMetric(metrics, "reference_loss");
+      const lr = latestMetric(metrics, "learning_rate");
+      const tok = latestMetric(metrics, "tokens_sec");
+      const it = latestMetric(metrics, "it_sec");
+      const mem = latestMetric(metrics, "memory_gb");
+      const tokens = latestMetric(metrics, "trained_tokens");
+      const items = [
+        readoutStat("train", Number.isFinite(train) ? formatLoss(train) : ""),
+        readoutStat("val", Number.isFinite(val) ? formatLoss(val) : ""),
+        readoutStat("lr", formatRate(lr)),
+        readoutStat("tok/s", Number.isFinite(tok) ? tok.toLocaleString(undefined, { maximumFractionDigits: 0 }) : ""),
+        readoutStat("it/s", Number.isFinite(it) ? it.toLocaleString(undefined, { maximumFractionDigits: 2 }) : ""),
+        readoutStat("peak GB", Number.isFinite(mem) ? mem.toFixed(1) : ""),
+        readoutStat("tokens", Number.isFinite(tokens) ? tokens.toLocaleString(undefined, { maximumFractionDigits: 0 }) : ""),
+      ].filter(Boolean);
+      readoutEl.replaceChildren(...items);
+      readoutEl.hidden = items.length === 0;
+    }
+
     function drawMetrics(metrics) {
       drawChart(document.getElementById("twinLossChart"), metrics, ["train_loss", "reference_loss"]);
       drawChart(document.getElementById("twinSpeedChart"), metrics, ["tokens_sec"]);
@@ -988,13 +1036,14 @@
       document.getElementById("twinPeakMemory").textContent = memory.length
         ? "Peak " + Math.max(...memory).toFixed(1) + " GB"
         : "";
+      drawReadout(metrics);
     }
 
     const STEP_COPY = [
       "Count usable text without exposing it.",
       "Sessionize 1:1 chats and hold out later sessions.",
       "Download weights if needed, then train on your JSONL.",
-      "Opens automatically when the adapter is ready.",
+      "Open chat when you want to try the adapter.",
     ];
     const STEP_LIVE = {
       inspecting: "Counting usable sent text…",
@@ -1290,6 +1339,7 @@
       const chatReady = !!(chatSelect.value && !chatPicker.hidden);
       sendBtn.disabled = busy || !chatReady || sending;
       input.disabled = busy || !chatReady;
+      if (goChatBtn) goChatBtn.hidden = busy || !chatReady;
       if (!s.mlx) {
         statusEl.textContent = "mlx-lm is not installed.";
       } else if (WAITING_PHASES.includes(s.phase) || s.phase === "training" || s.phase === "cancelling") {
@@ -1299,16 +1349,16 @@
       } else if (s.phase === "cancelled") {
         statusEl.textContent = "Training stopped.";
       } else if (modelReady && s.early_stopped) {
-        statusEl.textContent = model.name + " adapter ready. Reference loss plateaued; kept the best checkpoint.";
+        statusEl.textContent = model.name + " adapter ready. Validation loss plateaued; kept the best checkpoint.";
       } else if (modelReady) {
-        statusEl.textContent = model.name + " adapter ready. Send a text or retrain it.";
+        statusEl.textContent = model.name + " adapter ready. Review the curves, then go to chat.";
       } else {
         statusEl.textContent = model ? model.name + " has not been trained yet." : "Choose a model.";
       }
       const losses = latestLosses(s.metrics);
       const bits = [];
-      if (s.phase === "training" && losses.train != null) bits.push("train " + formatLoss(losses.train));
-      if (s.phase === "training" && losses.reference != null) bits.push("ref " + formatLoss(losses.reference));
+      if (losses.train != null) bits.push("train " + formatLoss(losses.train));
+      if (losses.reference != null) bits.push("val " + formatLoss(losses.reference));
       const eta = formatDuration(s.eta_seconds);
       if (eta) bits.push("~" + eta + " left");
       else if (busy && s.elapsed_seconds) bits.push(formatDuration(s.elapsed_seconds));
@@ -1336,8 +1386,15 @@
           person.trained.push(s.model);
         }
         resetChat();
-        showTab("chat", true);
-        setHash("chat");
+        showTab("model", true);
+        setHash("model");
+        revealSignals(true);
+        requestAnimationFrame(() => {
+          (metricsEl || page.querySelector(".twin-train")).scrollIntoView({
+            block: "start",
+            behavior: reduceMotion ? "auto" : "smooth",
+          });
+        });
         loadPeople();
       } else if (wasBusy && !busy) {
         loadPeople();
@@ -1359,7 +1416,7 @@
         } else if (s.early_stopped) {
           hintEl.textContent = "Holdout loss stopped improving, so training ended. Chat uses the best checkpoint. Continue from it if you want more steps.";
         } else if (modelReady) {
-          hintEl.textContent = "Each train writes a new adapter. Earlier checkpoints stay in the chat list.";
+          hintEl.textContent = "Each train writes a new adapter. Review the curves here, then go to chat when you want to try it.";
         } else {
           hintEl.textContent = "Quick uses 30 steps on a recent slice to check that training runs. Complete uses 1:1 sessions, a real holdout, and three epochs. Leave steps blank for that default.";
         }
@@ -1433,6 +1490,14 @@
     }
 
     stopBtn.addEventListener("click", stopTrain);
+
+    if (goChatBtn) {
+      goChatBtn.addEventListener("click", () => {
+        showTab("chat", true);
+        setHash("chat");
+        if (input && !input.disabled) input.focus();
+      });
+    }
 
     trainBtn.addEventListener("click", async () => {
       const run = (page.querySelector('input[name="twinrun"]:checked') || {}).value || "complete";

@@ -10,8 +10,11 @@ import threading
 import time
 
 from twin.export import (
+    CHAT_TEMP,
+    CHAT_TOP_P,
     CONTEXT_TURNS,
     ME,
+    clip_bubbles,
     coerce_chat,
     dataset_profile,
     export_dataset,
@@ -51,8 +54,12 @@ from twin.train import (
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 ITER_RE = re.compile(r"Iter\s+(\d+):")
 TRAIN_RE = re.compile(
-    r"Iter\s+(\d+):\s+Train loss\s+([0-9.eE+-]+).*?Tokens/sec\s+([0-9.eE+-]+)"
-    r"(?:.*?Peak mem\s+([0-9.eE+-]+)\s+GB)?"
+    r"Iter\s+(?P<iter>\d+):\s+Train loss\s+(?P<loss>[0-9.eE+-]+)"
+    r"(?:.*?Learning Rate\s+(?P<lr>[0-9.eE+-]+))?"
+    r"(?:.*?It/sec\s+(?P<it>[0-9.eE+-]+))?"
+    r".*?Tokens/sec\s+(?P<tok>[0-9.eE+-]+)"
+    r"(?:.*?Trained Tokens\s+(?P<n_tok>[0-9.eE+-]+))?"
+    r"(?:.*?Peak mem\s+(?P<mem>[0-9.eE+-]+)\s+GB)?"
 )
 VAL_RE = re.compile(r"Iter\s+(\d+):\s+Val loss\s+([0-9.eE+-]+)")
 DOWNLOAD_RE = re.compile(r"(?i)(downloading|fetching\s+\d+\s+files)")
@@ -226,12 +233,18 @@ def parse_metric(line):
     match = TRAIN_RE.search(clean)
     if match:
         metric = {
-            "iter": int(match.group(1)),
-            "train_loss": float(match.group(2)),
-            "tokens_sec": float(match.group(3)),
+            "iter": int(match.group("iter")),
+            "train_loss": float(match.group("loss")),
+            "tokens_sec": float(match.group("tok")),
         }
-        if match.group(4):
-            metric["memory_gb"] = float(match.group(4))
+        if match.group("lr"):
+            metric["learning_rate"] = float(match.group("lr"))
+        if match.group("it"):
+            metric["it_sec"] = float(match.group("it"))
+        if match.group("n_tok"):
+            metric["trained_tokens"] = float(match.group("n_tok"))
+        if match.group("mem"):
+            metric["memory_gb"] = float(match.group("mem"))
         return metric
     match = VAL_RE.search(clean)
     if match:
@@ -867,8 +880,9 @@ def chat(
     person_id=ME,
     adapter=None,
     retrieve_pairs=True,
-    temp=0.0,
-    top_p=0.9,
+    temp=CHAT_TEMP,
+    top_p=CHAT_TOP_P,
+    to=None,
 ):
     text = (text or "").strip()
     if not text:
@@ -886,13 +900,16 @@ def chat(
     with _gen_lock:
         model, tokenizer = _load_model(model_key, person_id, run_id, step)
         from mlx_lm import generate
+        from twin.chat import generate_kwargs
 
-        messages = [{"role": "system", "content": system_for(subject["name"])}]
+        messages = [{"role": "system", "content": system_for(subject["name"], peer=to)}]
         shots = []
         if retrieve_pairs:
             from twin.retrieve import RETRIEVE_K, few_shot_messages, load_index, retrieve
 
-            pairs = retrieve(text, load_index(TWIN_DIR), k=RETRIEVE_K, exclude=[text])
+            pairs = retrieve(
+                text, load_index(TWIN_DIR), k=RETRIEVE_K, exclude=[text], peer=to
+            )
             shots = few_shot_messages(pairs)
         live = []
         if history:
@@ -912,14 +929,8 @@ def chat(
             **config.get("chat_template_args", {}),
         )
         try:
-            kwargs = {"prompt": prompt, "max_tokens": 96}
-            if temp and temp > 0:
-                from mlx_lm.sample_utils import make_sampler
-                import mlx.core as mx
-
-                mx.random.seed(0)
-                kwargs["sampler"] = make_sampler(temp, top_p=top_p)
-            return generate(model, tokenizer, **kwargs).strip()
+            kwargs = generate_kwargs(96, temp=temp, top_p=top_p, seed=0)
+            return clip_bubbles(generate(model, tokenizer, prompt=prompt, **kwargs).strip())
         except Exception as e:
             with _lock:
                 _drop_model_locked()

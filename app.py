@@ -184,6 +184,7 @@ class Handler(BaseHTTPRequestHandler):
                     model_key=body.get("model") or "balanced",
                     person_id=body.get("person") or "me",
                     adapter=body.get("adapter") or None,
+                    to=body.get("to") or None,
                 )
             except TwinError as e:
                 self._send_json({"error": str(e)}, status=409)

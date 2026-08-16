@@ -4,7 +4,7 @@ import json
 import os
 import re
 
-from twin.export import TWIN_DIR
+from twin.export import TWIN_DIR, recency_weight
 
 TOKEN_RE = re.compile(r"[a-z0-9']+", re.I)
 RETRIEVE_K = 2
@@ -41,6 +41,8 @@ def load_index(data_dir=TWIN_DIR):
                         {
                             "query": query,
                             "reply": reply,
+                            "peer": (row.get("peer") or "").strip(),
+                            "date": row.get("date") or 0,
                             "tokens": tokenize(query),
                         }
                     )
@@ -49,17 +51,27 @@ def load_index(data_dir=TWIN_DIR):
     return rows
 
 
-def retrieve(query, index, k=RETRIEVE_K, exclude=None):
-    """Return up to ``k`` train pairs whose incoming text is closest to ``query``."""
+def retrieve(query, index, k=RETRIEVE_K, exclude=None, peer=None):
+    """Return up to ``k`` train pairs whose incoming text is closest to ``query``.
+
+    Recency and a matching recipient raise the score so old or off-thread
+    pairs do not crowd out current style.
+    """
     tokens = tokenize(query)
     exclude = {item.strip() for item in (exclude or []) if item}
+    now = max((row.get("date") or 0) for row in index) if index else 0
+    want = (peer or "").strip()
     scored = []
     for row in index:
         if row["query"] in exclude or row["query"] == (query or "").strip():
             continue
-        score = _overlap(tokens, row["tokens"])
-        if score > 0:
-            scored.append((score, row))
+        overlap = _overlap(tokens, row["tokens"])
+        if overlap <= 0:
+            continue
+        recency = recency_weight(row.get("date") or 0, now)
+        boost = 1.2 if want and row.get("peer") == want else 1.0
+        score = overlap * (0.5 + 0.5 * recency) * boost
+        scored.append((score, row))
     scored.sort(key=lambda item: (-item[0], item[1]["query"]))
     return [
         {"query": row["query"], "reply": row["reply"]}

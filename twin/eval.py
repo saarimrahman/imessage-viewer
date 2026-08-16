@@ -22,8 +22,12 @@ if str(ROOT) not in sys.path:
 
 from twin.export import (
     BUBBLE,
+    CHAT_TEMP,
+    CHAT_TOP_P,
     CONTEXT_TURNS,
     TWIN_DIR,
+    clip_bubbles,
+    peer_from_system,
     split_bubbles,
     system_for,
 )
@@ -127,7 +131,7 @@ def style_stats(text):
     }
 
 
-def score_reply(pred, gold, prompt=""):
+def score_reply(pred, gold, prompt="", hit_limit=False):
     pred = (pred or "").strip()
     gold = (gold or "").strip()
     gold_stats = style_stats(gold)
@@ -141,6 +145,8 @@ def score_reply(pred, gold, prompt=""):
         "emoji_delta": pred_stats["emoji"] - gold_stats["emoji"],
         "copied_history": bool(pred) and pred in (prompt or ""),
         "exact": pred == gold,
+        "hit_limit": bool(hit_limit),
+        "text": pred,
         "pred": pred_stats,
         "gold": gold_stats,
     }
@@ -181,7 +187,14 @@ def prompt_messages(example, retrieve_index=None, retrieve_k=0):
         body = body[:-1]
     if retrieve_index and retrieve_k:
         query = last_user(body)
-        shots = retrieve(query, retrieve_index, k=retrieve_k, exclude=[query])
+        system_text = body[0].get("content") or "" if body and body[0].get("role") == "system" else ""
+        shots = retrieve(
+            query,
+            retrieve_index,
+            k=retrieve_k,
+            exclude=[query],
+            peer=peer_from_system(system_text),
+        )
         if shots:
             system = body[:1] if body and body[0].get("role") == "system" else []
             rest = body[len(system) :]
@@ -203,7 +216,7 @@ def mean(values):
 def summarize(rows):
     if not rows:
         return {}
-    return {
+    out = {
         "n": len(rows),
         "chrf": mean(r["chrf"] for r in rows),
         "rouge_l": mean(r["rouge_l"] for r in rows),
@@ -212,6 +225,40 @@ def summarize(rows):
         "copied_history": mean(1.0 if r["copied_history"] else 0.0 for r in rows),
         "len_ratio": mean(r["len_ratio"] for r in rows),
         "bubble_delta": mean(r["bubble_delta"] for r in rows),
+        "eos_rate": mean(0.0 if r.get("hit_limit") else 1.0 for r in rows),
+    }
+    out.update(recipient_summary(rows))
+    return out
+
+
+def recipient_summary(rows):
+    """How much reply quality and modal text vary by recipient."""
+    by = {}
+    for row in rows:
+        peer = row.get("peer") or ""
+        if not peer:
+            continue
+        by.setdefault(peer, []).append(row)
+    if len(by) < 2:
+        return {}
+    means = {
+        peer: mean(ranking_score(row) for row in group)
+        for peer, group in by.items()
+        if len(group) >= 2
+    }
+    if len(means) < 2:
+        return {"peers": len(by)}
+    modal = {}
+    for peer, group in by.items():
+        texts = [row.get("text") or "" for row in group]
+        modal[peer] = Counter(texts).most_common(1)[0][0] if texts else ""
+    global_mode = Counter(row.get("text") or "" for row in rows).most_common(1)
+    mode_text = global_mode[0][0] if global_mode else ""
+    collapsed = mean(1.0 if text == mode_text and mode_text else 0.0 for text in modal.values())
+    return {
+        "peers": len(by),
+        "peer_score_range": max(means.values()) - min(means.values()),
+        "peer_mode_collapse": collapsed,
     }
 
 
@@ -233,9 +280,9 @@ def smoke_template(tokenizer, chat_template_args=None, name="You"):
     return True
 
 
-def generate_reply(model, tokenizer, messages, chat_template_args=None, max_tokens=96, temp=0.0, top_p=0.9, seed=0):
+def generate_reply(model, tokenizer, messages, chat_template_args=None, max_tokens=96, temp=0.0, top_p=CHAT_TOP_P, seed=0):
     from mlx_lm import generate
-    from mlx_lm.sample_utils import make_sampler
+    from twin.chat import generate_kwargs
 
     prompt = tokenizer.apply_chat_template(
         messages,
@@ -243,16 +290,16 @@ def generate_reply(model, tokenizer, messages, chat_template_args=None, max_toke
         add_generation_prompt=True,
         **(chat_template_args or {}),
     )
-    sampler = None
-    if temp and temp > 0:
-        import mlx.core as mx
-
-        mx.random.seed(seed)
-        sampler = make_sampler(temp, top_p=top_p)
-    kwargs = {"prompt": prompt, "max_tokens": max_tokens}
-    if sampler is not None:
-        kwargs["sampler"] = sampler
-    return generate(model, tokenizer, **kwargs).strip()
+    kwargs = generate_kwargs(max_tokens, temp=temp, top_p=top_p, seed=seed)
+    raw = generate(model, tokenizer, prompt=prompt, **kwargs)
+    text = (raw or "").strip()
+    n_tok = 0
+    if hasattr(tokenizer, "encode"):
+        try:
+            n_tok = len(tokenizer.encode(text))
+        except Exception:
+            n_tok = 0
+    return clip_bubbles(text), n_tok >= max(1, max_tokens) - 1
 
 
 def evaluate_split(
@@ -263,7 +310,7 @@ def evaluate_split(
     retrieve_index=None,
     retrieve_k=0,
     temp=0.0,
-    top_p=0.9,
+    top_p=CHAT_TOP_P,
     seed=0,
     max_examples=0,
     max_tokens=96,
@@ -274,7 +321,7 @@ def evaluate_split(
         messages = prompt_messages(example, retrieve_index, retrieve_k)
         gold = gold_reply(example.get("messages") or [])
         prompt = " ".join(m.get("content") or "" for m in messages)
-        pred = generate_reply(
+        pred, hit_limit = generate_reply(
             model,
             tokenizer,
             messages,
@@ -284,7 +331,10 @@ def evaluate_split(
             top_p=top_p,
             seed=seed + i,
         )
-        scored.append(score_reply(pred, gold, prompt))
+        row = score_reply(pred, gold, prompt, hit_limit=hit_limit)
+        system = (example.get("messages") or [{}])[0].get("content") or ""
+        row["peer"] = peer_from_system(system)
+        scored.append(row)
     return summarize(scored), scored
 
 
@@ -371,7 +421,7 @@ def main():
     parser.add_argument("--retrieve", action="store_true")
     parser.add_argument("--base", action="store_true", help="Score the base model without an adapter")
     parser.add_argument("--temp", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--top-p", type=float, default=CHAT_TOP_P)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--grid", action="store_true", help="Print the hyperparameter grid and exit")
     parser.add_argument("--smoke", action="store_true", help="Render one example with the tokenizer")
@@ -401,7 +451,7 @@ def main():
     adapter = None if args.base else args.adapter
     (model, tokenizer), _ = _load_mlx(args.model_key, adapter)
     index = load_index(args.data) if args.retrieve else None
-    temps = [0.0, 0.4] if args.compare_decoding else [args.temp]
+    temps = [0.0, CHAT_TEMP] if args.compare_decoding else [args.temp]
     retrieve_ks = [0, RETRIEVE_K] if args.retrieve else [0]
     for temp in temps:
         for k in retrieve_ks:

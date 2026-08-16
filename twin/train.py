@@ -603,6 +603,18 @@ def epochs_for(config, complete=True):
     return int(config.get("epochs") or COMPLETE_EPOCHS)
 
 
+def last_train_error(lines, limit=240):
+    """Last useful MLX log line, for the UI when the trainer process dies."""
+    for line in reversed(lines or ()):
+        text = str(line).strip()
+        if not text:
+            continue
+        if text.startswith(("File ", "~", "^", "The above")):
+            continue
+        return text[:limit]
+    return ""
+
+
 def write_train_config(path, iters, learning_rate):
     """Warmup plus cosine decay. MLX reads this as --config."""
     import yaml
@@ -796,9 +808,14 @@ def run_train(
     )
     if on_proc:
         on_proc(proc)
+    tail = []
     try:
         for line in proc.stdout:
             line = line.rstrip("\n")
+            if line.strip():
+                tail.append(line)
+                if len(tail) > 80:
+                    del tail[: len(tail) - 80]
             if on_line:
                 on_line(line)
             else:
@@ -808,7 +825,8 @@ def run_train(
         if on_proc:
             on_proc(None)
     if code != 0:
-        raise RuntimeError(f"training exited {code}")
+        hint = last_train_error(tail)
+        raise RuntimeError(f"training exited {code}" + (f": {hint}" if hint else ""))
 
 
 def main():

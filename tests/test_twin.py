@@ -10,22 +10,28 @@ from twin.export import (
     ME,
     OPENER_PROMPT,
     SYSTEM,
+    cap_duplicate_targets,
+    clip_bubbles,
     coerce_chat,
     collapse_turns,
+    downsample_recency,
     examples_from_turns,
     fit_messages,
     is_alternating,
+    is_artifact,
     is_assistant_row,
+    is_low_signal,
     opener_for,
     parse_person_arg,
     partition_examples,
     person_id_for,
+    redact_text,
     resolve_subject,
     sessionize,
     system_for,
     write_dataset,
 )
-from twin.eval import chr_f, ranking_score, rouge_l, score_reply
+from twin.eval import chr_f, ranking_score, recipient_summary, rouge_l, score_reply
 from twin.retrieve import retrieve
 from twin.job import (
     BUSY_PHASES,
@@ -40,6 +46,7 @@ from twin.job import (
     stop_train,
     chat as twin_chat,
 )
+from twin.mlx_lora import clamp_prompt_mask, pin_chat_template_args
 from twin.train import (
     DEFAULT_MODEL,
     MODELS,
@@ -47,6 +54,7 @@ from twin.train import (
     checkpoint_id,
     hash_train_file,
     has_adapter,
+    last_train_error,
     list_adapter_runs,
     make_run_id,
     note_reference_eval,
@@ -193,6 +201,8 @@ class TwinPersonTest(unittest.TestCase):
         self.assertNotIn("I would", system_for("Alex"))
         self.assertIn("Alex", opener_for("Alex"))
         self.assertEqual(opener_for("You"), OPENER_PROMPT)
+        self.assertIn("You are texting Mom.", system_for("You", peer="Mom"))
+        self.assertEqual(system_for("You"), SYSTEM)
 
     def test_contact_adapter_does_not_reuse_your_adapter_path(self):
         yours = adapter_dir("qwen3-capable")
@@ -335,6 +345,72 @@ class SessionAndFitTest(unittest.TestCase):
         self.assertGreater(chr_f("yeah 10", "yeah 10"), 0.9)
         self.assertGreater(rouge_l("yeah wait 20", "yeah wait 20"), 0.9)
 
+    def test_tapback_summaries_are_style_artifacts(self):
+        self.assertTrue(is_artifact('Loved “hey”'))
+        self.assertTrue(is_artifact('Liked "sounds good"'))
+        self.assertTrue(is_artifact("Laughed at an image"))
+        self.assertTrue(is_artifact("You unsent a message."))
+        self.assertFalse(is_artifact("loved that set"))
+        self.assertFalse(is_artifact("ok sounds good"))
+
+    def test_redaction_keeps_ordinary_chat(self):
+        self.assertEqual(redact_text("ok sounds good"), "ok sounds good")
+        self.assertEqual(redact_text("see you at 7"), "see you at 7")
+        self.assertIn("[email]", redact_text("email me at a@b.com later"))
+        self.assertIn("[phone]", redact_text("call 555-123-4567"))
+        self.assertEqual(redact_text("482193"), "[code]")
+        self.assertIn("[password]", redact_text("password: hunter2"))
+
+    def test_duplicate_and_short_targets_are_capped(self):
+        def row(reply, date, idx):
+            return {"_reply": reply, "_date": date, "_id": idx}
+
+        short = [row("lol", i, i) for i in range(10)]
+        kept, dropped = cap_duplicate_targets(short)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dropped, 8)
+        self.assertTrue(all(is_low_signal(item["_reply"]) for item in kept))
+
+        unique = [row(f"on my way to {i}", i, i) for i in range(6)]
+        kept, dropped = cap_duplicate_targets(unique)
+        self.assertEqual(len(kept), 6)
+        self.assertEqual(dropped, 0)
+
+        repeats = [row("on my way home", i, i) for i in range(9)]
+        kept, dropped = cap_duplicate_targets(repeats)
+        self.assertEqual(len(kept), 4)
+        self.assertEqual(dropped, 5)
+
+    def test_recency_keeps_new_rows_and_can_drop_old_ones(self):
+        year = 365 * 24 * 60 * 60 * 1_000_000_000
+        rows = [{"_reply": str(i), "_date": 0 if i < 40 else 3 * year, "_id": i} for i in range(50)]
+        kept, dropped = downsample_recency(rows, rng=__import__("random").Random(0))
+        self.assertGreater(dropped, 0)
+        self.assertGreater(len(kept), 10)
+        self.assertTrue(any(row["_date"] == 3 * year for row in kept))
+
+    def test_clip_bubbles_stops_a_delimiter_loop(self):
+        loop = BUBBLE.join(["yo"] * 8)
+        clipped = clip_bubbles(loop)
+        self.assertEqual(clipped.count(BUBBLE), 3)
+        self.assertEqual(clip_bubbles("just one"), "just one")
+
+    def test_eos_rate_and_recipient_collapse_are_scored(self):
+        ok = score_reply("yeah give me 10", "yeah give me 10", hit_limit=False)
+        runaway = score_reply("yeah " * 40, "yeah give me 10", hit_limit=True)
+        self.assertEqual(ok["hit_limit"], False)
+        self.assertEqual(runaway["hit_limit"], True)
+        rows = [
+            {"peer": "Mom", "text": "on my way", "chrf": 0.8, "rouge_l": 0.5, "len_ratio": 1, "copied_history": False},
+            {"peer": "Mom", "text": "on my way", "chrf": 0.7, "rouge_l": 0.4, "len_ratio": 1, "copied_history": False},
+            {"peer": "Alex", "text": "on my way", "chrf": 0.2, "rouge_l": 0.1, "len_ratio": 1, "copied_history": False},
+            {"peer": "Alex", "text": "on my way", "chrf": 0.2, "rouge_l": 0.1, "len_ratio": 1, "copied_history": False},
+        ]
+        summary = recipient_summary(rows)
+        self.assertEqual(summary["peers"], 2)
+        self.assertGreater(summary["peer_score_range"], 0)
+        self.assertEqual(summary["peer_mode_collapse"], 1.0)
+
 
 class TwinJobTest(unittest.TestCase):
     def test_parse_iter_from_mlx_log_line(self):
@@ -345,12 +421,20 @@ class TwinJobTest(unittest.TestCase):
         train = parse_metric(
             "Iter 20: Train loss 1.231, Learning Rate 1e-4, Tokens/sec 245.5, Peak mem 4.321 GB"
         )
+        full = parse_metric(
+            "Iter 1: Train loss 4.557, Learning Rate 1.000e-05, It/sec 0.529, "
+            "Tokens/sec 49.715, Trained Tokens 94, Peak mem 3.458 GB"
+        )
         valid = parse_metric("Iter 20: Val loss 1.456, Val took 2.0s")
 
         self.assertEqual(train["iter"], 20)
         self.assertEqual(train["train_loss"], 1.231)
         self.assertEqual(train["tokens_sec"], 245.5)
         self.assertEqual(train["memory_gb"], 4.321)
+        self.assertEqual(train["learning_rate"], 0.0001)
+        self.assertEqual(full["it_sec"], 0.529)
+        self.assertEqual(full["trained_tokens"], 94)
+        self.assertEqual(full["learning_rate"], 1e-5)
         self.assertEqual(valid, {"iter": 20, "reference_loss": 1.456})
 
     def test_snapshot_has_the_fields_the_ui_reads(self):
@@ -440,8 +524,8 @@ class TwinJobTest(unittest.TestCase):
         mlx = MagicMock()
         mlx.generate.return_value = " yo "
         with patch("twin.job._load_model", return_value=(object(), tokenizer)):
-            with patch.dict("sys.modules", {"mlx_lm": mlx}):
-                reply = twin_chat("hey", model_key="qwen3-balanced")
+            with patch.dict("sys.modules", {"mlx_lm": mlx, "mlx_lm.sample_utils": mlx}):
+                reply = twin_chat("hey", model_key="qwen3-balanced", temp=0)
 
         self.assertEqual(reply, "yo")
         self.assertEqual(
@@ -509,6 +593,49 @@ class TwinModelTest(unittest.TestCase):
     def test_complete_steps_cover_every_example(self):
         self.assertEqual(steps_for_examples(101, 4), 26)
         self.assertEqual(steps_for_examples(101, 4, epochs=3), 78)
+
+    def test_chat_template_pin_does_not_recurse_through_mlx_wrapper(self):
+        class Inner:
+            def apply_chat_template(self, messages, **kwargs):
+                return dict(kwargs)
+
+        class Wrapper:
+            def __init__(self):
+                object.__setattr__(self, "_tokenizer", Inner())
+
+            def apply_chat_template(self, *args, **kwargs):
+                if "enable_thinking" not in kwargs:
+                    kwargs["enable_thinking"] = True
+                return self._tokenizer.apply_chat_template(*args, **kwargs)
+
+            def __setattr__(self, attr, value):
+                if attr.startswith("_"):
+                    object.__setattr__(self, attr, value)
+                else:
+                    setattr(self._tokenizer, attr, value)
+
+        tokenizer = Wrapper()
+        pin_chat_template_args(tokenizer, {"enable_thinking": False})
+        out = tokenizer.apply_chat_template([{"role": "user", "content": "hi"}])
+        self.assertEqual(out["enable_thinking"], False)
+
+    def test_prompt_mask_falls_back_when_generation_prompt_is_longer(self):
+        tokens = list(range(23))
+        self.assertEqual(clamp_prompt_mask(tokens, 22), (tokens, 22))
+        self.assertEqual(clamp_prompt_mask(tokens, 23), (tokens, 0))
+        self.assertEqual(clamp_prompt_mask(tokens, 24), (tokens, 0))
+
+    def test_failed_trainer_keeps_the_last_mlx_line(self):
+        self.assertEqual(
+            last_train_error(
+                [
+                    "Loading pretrained model",
+                    '  File "mlx_lm/lora.py", line 1',
+                    "RecursionError: maximum recursion depth exceeded",
+                ]
+            ),
+            "RecursionError: maximum recursion depth exceeded",
+        )
 
     def test_training_command_reports_loss_and_holdout_loss(self):
         cmd = train_command("model", "data", "adapter", 100, steps_per_report=5, steps_per_eval=20)
@@ -666,6 +793,10 @@ class TwinPageTest(unittest.TestCase):
         self.assertIn('role="progressbar"', html)
         self.assertIn('id="twinSteps"', html)
         self.assertIn('id="twinStop"', html)
+        self.assertIn('id="twinGoChat"', html)
+        self.assertIn("Go to chat", html)
+        self.assertNotIn("Opens automatically when the adapter is ready.", html)
+        self.assertIn('id="twinMetricReadout"', html)
         self.assertIn('id="twinRuns"', html)
         self.assertIn('id="twinRunList"', html)
         self.assertIn('id="twinRunsTitle"', html)

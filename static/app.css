@@ -2086,6 +2086,14 @@ body.twinpage { background: var(--bg-chat); }
 
 .twin-stop[hidden] { display: none; }
 
+.twin-go-chat {
+  min-height: 40px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.twin-go-chat[hidden] { display: none; }
+
 .twin-progress-meta {
   margin: 0;
   color: var(--muted);
@@ -2691,6 +2699,30 @@ body.twinpage { background: var(--bg-chat); }
 }
 
 .twin-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.twin-metric-readout {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(76px, 1fr));
+  gap: 8px 12px;
+  margin: 12px 0 0;
+}
+.twin-metric-readout[hidden] { display: none; }
+.twin-metric-readout dd {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+.twin-metric-readout dt {
+  margin: 3px 0 0;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
 .twin-chart { margin: 0; min-width: 0; }
 .twin-chart figcaption { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .twin-chart figcaption strong { font-size: 13px; }

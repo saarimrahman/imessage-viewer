@@ -10,11 +10,13 @@ Complete trains on direct 1:1 chats only. Group chats are counted on the Audit t
 
 The exporter splits each chat into sessions at a 12-hour gap. Consecutive bubbles from the same person stay together with a `<|bubble|>` delimiter. A 30-minute gap starts a new bubble group. Training windows do not cross sessions.
 
-Each authentic reply with incoming context becomes one example. Conversation starters with no incoming message in that session are not mixed into reply training. Later sessions are held out 80/10/10 by session, so `valid.jsonl` and `test.jsonl` are not copies of training.
+Each authentic reply with incoming context becomes one example. Conversation starters with no incoming message in that session are not mixed into reply training. Tapback summaries, unsent notices, media-only turns, and link-only replies are dropped. Secrets in the remaining text are replaced with placeholders before training.
+
+Short acknowledgments such as "ok" or "lol" are capped so they cannot dominate the target distribution. Exact duplicate replies are limited. Older train sessions are kept with decaying probability so recent style has more weight. Later sessions are held out 80/10/10 by session, so `valid.jsonl` and `test.jsonl` are not copies of training.
 
 Each example is trimmed from the oldest context so the full target reply always fits `max_seq_length`. Examples whose target cannot fit are dropped.
 
-Training and chat use the same system prompt, the same 10-turn context budget, and the same chat-template kwargs.
+Training and chat use the same system prompt, the same 10-turn context budget, and the same chat-template kwargs. The system prompt names the other person in a 1:1 chat so the twin can switch register. Chat samples at temperature 0.5 with a bubble cap and a repetition penalty. Pass `--to` so live chat matches that recipient conditioning.
 
 Media-only messages do not contain text for the model. The Audit section counts these messages separately.
 
@@ -52,7 +54,7 @@ Complete builds sessionized 1:1 pairs, holds out later sessions, and trains abou
 
 Each train writes a new adapter folder named with the start time, a hash of `train.jsonl`, and the step count. Earlier adapters stay on disk. Stop mid-run and you can still chat with the last save, or continue from it.
 
-The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. Chat also retrieves two similar train-set incoming/reply pairs when `retrieve.jsonl` exists.
+The chat dropdown lists those runs and their checkpoints. It defaults to the latest save of the newest run. Chat also retrieves two similar train-set incoming/reply pairs when `retrieve.jsonl` exists. Retrieval prefers recent pairs and, when `--to` is set, pairs with the same recipient.
 
 The charts show training loss, holdout loss, throughput, and peak memory.
 
@@ -67,7 +69,7 @@ Export the complete dataset for the recommended tokenizer. Then train Qwen 3 4B 
 ./.venv/bin/python twin/train.py --model-key qwen3-capable --iters 500 --resume qwen3-capable/20260816-160000-ab12cd34ef56-2000/latest
 ```
 
-Score holdout replies, including greedy vs sampling and LoRA vs LoRA plus retrieval:
+Score holdout replies, including greedy vs sampling and LoRA vs LoRA plus retrieval. Reports include EOS rate and per-recipient collapse. For a human A/B, ask people who actually text with you.
 
 ```bash
 ./.venv/bin/python twin/eval.py --model-key qwen3-capable --adapter .cache/twin/adapters/qwen3-capable/<run> --split valid
@@ -86,7 +88,8 @@ Start an interactive chat with the Qwen 3 4B adapter.
 
 ```bash
 ./.venv/bin/python twin/chat.py --model-key qwen3-capable
-./.venv/bin/python twin/chat.py --model-key qwen3-capable --no-retrieve --temp 0.4
+./.venv/bin/python twin/chat.py --model-key qwen3-capable --no-retrieve --temp 0.5
+./.venv/bin/python twin/chat.py --model-key qwen3-capable --to Mom --once "you free tonight?"
 ./.venv/bin/python twin/chat.py --checkpoint qwen3-capable/20260816-160000-ab12cd34ef56-2000/latest
 ```
 
