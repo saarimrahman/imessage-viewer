@@ -319,6 +319,19 @@ def model_config(model_key):
         raise ValueError(f"Unknown model: {model_key}") from e
 
 
+def data_dir(person_id="me"):
+    """Where one person's exported dataset lives.
+
+    Adapters were already stored for each person, but every export wrote to
+    TWIN_DIR. Training a second person therefore overwrote the first person's
+    data, and chat retrieved few-shot pairs written by whoever was exported
+    last.
+    """
+    if not person_id or person_id == "me":
+        return TWIN_DIR
+    return os.path.join(TWIN_DIR, "people", person_id, "data")
+
+
 def adapter_dir(model_key, person_id="me"):
     if not person_id or person_id == "me":
         return os.path.join(TWIN_DIR, "adapters", model_key)
@@ -474,6 +487,16 @@ def load_dir_for(path, step="latest"):
     """Directory MLX can load: adapter_config.json + adapters.safetensors."""
     weights = checkpoint_weight_file(path, step)
     if not weights:
+        # A named step that was never written must not fall back to the final
+        # weights. Doing so scored four "checkpoints" of one run as identical
+        # and wasted the run. `save_every` floors at 50 and is `iters // 20`,
+        # so a step has to be a multiple of that.
+        if str(step).isdigit():
+            saved = checkpoint_steps(path)
+            raise FileNotFoundError(
+                f"No checkpoint at step {step} in {path}. Saved steps: "
+                f"{saved if saved else 'none'}"
+            )
         return path
     latest = os.path.join(path, ADAPTER_WEIGHTS)
     if os.path.abspath(weights) == os.path.abspath(latest):
@@ -525,7 +548,14 @@ def _newest_run(runs):
     return max(runs, key=lambda item: _path_created_at(item[1]))
 
 
-def public_checkpoints(path, model_key, run_id, iters=0, status=""):
+def public_checkpoints(path, model_key, run_id, iters=0, status="", recommended=None):
+    """List the checkpoints for a run, best first.
+
+    The last checkpoint is the worst one measured. Training to the end of the
+    schedule cost 95% on style distance for the 4B, 32% for the 8B and 129% for
+    a per-contact run. When a holdout sweep has named a step, that step leads the
+    list and the chat page selects it.
+    """
     numbered = checkpoint_steps(path)
     if status == "ready" and iters:
         latest_n = iters
@@ -550,6 +580,15 @@ def public_checkpoints(path, model_key, run_id, iters=0, status=""):
                 "step_n": step,
             }
         )
+    if recommended:
+        # The best step is often the last one, and that entry is the "latest"
+        # row rather than a numbered one. Marking only numbered rows left the
+        # right weights selected with nothing saying why.
+        for i, ckpt in enumerate(out):
+            if ckpt["step_n"] == int(recommended):
+                ckpt["recommended"] = True
+                out.insert(0, out.pop(i))
+                break
     return out
 
 
@@ -575,8 +614,14 @@ def list_adapter_runs(person_id="me", model_key=None):
                     "examples": int(meta["examples"]) if meta.get("examples") else 0,
                     "run": meta.get("run") or ("legacy" if run_id == LEGACY_RUN else ""),
                     "resume_from": meta.get("resume_from") or "",
+                    "recommended_score": meta.get("recommended_score"),
                     "checkpoints": public_checkpoints(
-                        path, key, run_id, iters, meta.get("status") or ""
+                        path,
+                        key,
+                        run_id,
+                        iters,
+                        meta.get("status") or "",
+                        meta.get("recommended_step"),
                     ),
                 }
             )
@@ -590,9 +635,9 @@ def save_every_for(iters):
     return max(50, iters // 20)
 
 
-def grad_accumulation_for(config):
+def grad_accumulation_for(config, batch_size=None):
     """Reach an effective batch near 8 without growing the MLX microbatch."""
-    batch = max(1, int(config.get("batch_size") or 1))
+    batch = max(1, int(batch_size or config.get("batch_size") or 1))
     target = 4 if str(config.get("params") or "").startswith("8") else EFFECTIVE_BATCH
     return max(1, target // batch)
 
@@ -615,7 +660,7 @@ def last_train_error(lines, limit=240):
     return ""
 
 
-def write_train_config(path, iters, learning_rate):
+def write_train_config(path, iters, learning_rate, lora_rank=None, lora_scale=None, lora_dropout=None):
     """Warmup plus cosine decay. MLX reads this as --config."""
     import yaml
 
@@ -628,6 +673,12 @@ def write_train_config(path, iters, learning_rate):
             "warmup_init": 0.0,
         }
     }
+    if lora_rank or lora_scale or lora_dropout:
+        payload["lora_parameters"] = {
+            "rank": int(lora_rank or 8),
+            "scale": float(lora_scale if lora_scale is not None else 20.0),
+            "dropout": float(lora_dropout or 0.0),
+        }
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=False)
     return path
@@ -764,6 +815,10 @@ def run_train(
     schedule=False,
     run_test=False,
     chat_template_args=None,
+    multiturn_loss=False,
+    lora_rank=None,
+    lora_scale=None,
+    lora_dropout=None,
 ):
     train_path = os.path.join(data, "train.jsonl")
     if not os.path.exists(train_path):
@@ -774,7 +829,10 @@ def run_train(
     config_path = None
     if schedule:
         config_path = os.path.join(adapter, "twin_train.yaml")
-        write_train_config(config_path, iters, learning_rate)
+        write_train_config(
+            config_path, iters, learning_rate,
+            lora_rank=lora_rank, lora_scale=lora_scale, lora_dropout=lora_dropout,
+        )
     cmd = train_command(
         model,
         data,
@@ -798,6 +856,8 @@ def run_train(
     env["PYTHONUNBUFFERED"] = "1"
     if chat_template_args:
         env["TWIN_CHAT_TEMPLATE_ARGS"] = json.dumps(chat_template_args)
+    if multiturn_loss:
+        env["TWIN_MULTITURN_LOSS"] = "1"
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -851,6 +911,28 @@ def main():
         default="me",
         help="me, or a phone number / email / person id from the Twin page",
     )
+    parser.add_argument(
+        "--val-batches",
+        type=int,
+        default=None,
+        help="Holdout batches for each in-training eval. -1 uses the whole file.",
+    )
+    parser.add_argument(
+        "--no-test",
+        action="store_true",
+        help="Skip the final test-set pass",
+    )
+    parser.add_argument(
+        "--multiturn-loss",
+        action="store_true",
+        help="Put loss on every assistant turn in the window, not only the last",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lora-rank", type=int, default=None)
+    parser.add_argument("--lora-scale", type=float, default=None)
+    parser.add_argument("--lora-dropout", type=float, default=None)
+    parser.add_argument("--layers", type=int, default=None, help="LoRA layers to adapt")
     args = parser.parse_args()
     from twin.export import parse_person_arg
 
@@ -859,6 +941,7 @@ def main():
     except ValueError as e:
         sys.exit(str(e))
     config = model_config(args.model_key)
+    batch_size = args.batch_size if args.batch_size is not None else config["batch_size"]
     if args.iters is not None:
         if args.iters < 1 or args.iters > MAX_ITERS:
             sys.exit(f"--iters must be between 1 and {MAX_ITERS:,}")
@@ -871,7 +954,7 @@ def main():
         except OSError:
             sys.exit("No training data. Run: ./.venv/bin/python twin/export.py")
         epochs = args.epochs if args.epochs is not None else epochs_for(config, complete=True)
-        iters = steps_for_examples(examples, config["batch_size"], epochs=epochs)
+        iters = steps_for_examples(examples, batch_size, epochs=epochs)
     else:
         iters = 10
 
@@ -911,6 +994,9 @@ def main():
         "status": "running",
         "learning_rate": args.learning_rate or (COMPLETE_LR if args.complete else QUICK_LR),
         "epochs": args.epochs if args.epochs is not None else epochs_for(config, complete=args.complete),
+        "layers": args.layers if args.layers is not None else config["layers"],
+        "batch_size": batch_size,
+        "seed": args.seed,
     }
     write_run_metadata(adapter, meta)
 
@@ -920,15 +1006,21 @@ def main():
             model=config["repo"],
             data=args.data,
             adapter=adapter,
-            batch_size=config["batch_size"],
-            num_layers=config["layers"],
+            batch_size=batch_size,
+            num_layers=args.layers if args.layers is not None else config["layers"],
             resume_adapter_file=resume_file,
             learning_rate=meta["learning_rate"],
-            grad_accumulation=grad_accumulation_for(config) if args.complete else 1,
+            grad_accumulation=grad_accumulation_for(config, batch_size) if args.complete else 1,
             schedule=bool(args.complete),
-            run_test=bool(args.complete),
-            val_batches=-1 if args.complete else 25,
+            run_test=bool(args.complete) and not args.no_test,
+            val_batches=(
+                args.val_batches
+                if args.val_batches is not None
+                else (-1 if args.complete else 25)
+            ),
+            seed=args.seed,
             chat_template_args=config.get("chat_template_args"),
+            multiturn_loss=args.multiturn_loss,
         )
     except FileNotFoundError:
         sys.exit("No training data. Run: ./.venv/bin/python twin/export.py")

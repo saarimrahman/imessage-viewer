@@ -1464,7 +1464,7 @@
       } else if (s.phase === "cancelled") {
         statusEl.textContent = "Training stopped.";
       } else if (modelReady && s.early_stopped) {
-        statusEl.textContent = model.name + " adapter ready. Validation loss plateaued; kept the best checkpoint.";
+        statusEl.textContent = model.name + " adapter ready. Validation loss plateaued, so training stopped early.";
       } else if (modelReady) {
         statusEl.textContent = model.name + " adapter ready. Review the curves, then go to chat.";
       } else {
@@ -1529,7 +1529,7 @@
           const who = isYou(selectedPerson()) ? "sent texts" : "texts";
           hintEl.textContent = s.examples.toLocaleString() + " train examples cover " + s.sent_texts.toLocaleString() + " " + who + " across " + s.chats.toLocaleString() + " direct chats.";
         } else if (s.early_stopped) {
-          hintEl.textContent = "Holdout loss stopped improving, so training ended. Chat uses the best checkpoint. Continue from it if you want more steps.";
+          hintEl.textContent = "Holdout loss stopped improving, so training ended. Chat starts on the last checkpoint, which is rarely the best one. Try the earlier steps in the chat picker.";
         } else if (modelReady) {
           hintEl.textContent = "Each train writes a new adapter. Review the curves here, then go to chat when you want to try it.";
         } else {

@@ -49,10 +49,20 @@ MAX_EXACT_TARGET = 4
 MAX_SHORT_TARGET = 2
 RECENCY_HALF_LIFE_NS = 365 * 24 * 60 * 60 * 1_000_000_000
 RECENCY_FLOOR = 0.15
-CHAT_TEMP = 0.5
+# 1.0 measured best on the holdout once the metric scored initiative: style
+# distance 1.138 against 1.282 at 0.7, with the question rate and the median
+# reply length both closer to the gold replies. The setting climbed 0.5 to 0.7
+# to 1.0 as the metric improved, because a surface metric rewards a model for
+# writing the average sentence and a cooler sampler does exactly that.
+# Held at 0.7. Temperature 1.0 wins on single replies, 1.138 against 1.282, but
+# every benchmark here scores one reply and chat runs many. At 1.0 with its own
+# replies in the context the 8B degraded into incoherent continuations. The
+# multi-turn comparison decides this.
+CHAT_TEMP = 0.7
 CHAT_TOP_P = 0.9
 MAX_BUBBLES = 4
 REPETITION_PENALTY = 1.0
+CHAT_REPETITION_PENALTY = 1.15
 TWIN_DIR = os.path.join(CACHE_DIR, "twin")
 LOW_SIGNAL = {
     "ok", "k", "kk", "okay", "ok.", "okay.",
@@ -161,13 +171,63 @@ def split_bubbles(text):
     return [part.strip() for part in text.split(BUBBLE) if part.strip()]
 
 
+SCAFFOLD_RE = re.compile(
+    r"<think>.*?</think>|</?think>|<tool_call>.*?</tool_call>|</?tool_call>"
+    r"|<\|im_start\|>|<\|im_end\|>",
+    flags=re.DOTALL,
+)
+
+
+THINK_INJECTION = (
+    "'<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') "
+    "+ '\\n</think>\\n\\n' + content.lstrip('\\n')"
+)
+THINK_REPLACEMENT = "'<|im_start|>' + message.role + '\\n' + content.lstrip('\\n')"
+
+
+def sanitize_chat_template(tokenizer):
+    """Stop the template from opening the target reply with an empty think block.
+
+    The Qwen 3 2507 template renders only the **last** assistant turn as
+    `<think>\\n\\n</think>\\n\\n` plus the content. Training then teaches the model
+    to emit that scaffolding first, while the base model goes straight to the
+    content after the generation prompt. The two disagree on the very first
+    token, and the adapter answers with stray special tokens such as
+    `<tool_call>`. Removing the injection makes the target match generation.
+
+    Returns True when the template changed.
+    """
+    template = getattr(tokenizer, "chat_template", None)
+    if not template or THINK_INJECTION not in template:
+        return False
+    patched = template.replace(THINK_INJECTION, THINK_REPLACEMENT)
+    try:
+        tokenizer.chat_template = patched
+    except Exception:
+        return False
+    return True
+
+
+def strip_scaffold(text):
+    """Remove chat-template scaffolding that the model emits before the reply.
+
+    The Qwen 3 2507 template renders the last assistant turn with an empty
+    `<think>` block. Training therefore teaches the model to open with
+    scaffolding, and it sometimes reaches for a neighbouring special token such
+    as `<tool_call>`. None of that is part of my message, so it must not be
+    scored or shown.
+    """
+    if not text:
+        return ""
+    return SCAFFOLD_RE.sub("", text).strip()
+
+
 def clip_bubbles(text, max_bubbles=MAX_BUBBLES):
     """Keep the first N bubbles so greedy decoding cannot loop on the delimiter."""
     text = (text or "").strip()
-    parts = split_bubbles(text)
-    if len(parts) <= max_bubbles:
-        return text
-    return join_bubbles(parts[:max_bubbles])
+    # Always rejoin. `split_bubbles` drops empty parts, so this also removes a
+    # trailing delimiter, which the model emits and the chat page displayed.
+    return join_bubbles(split_bubbles(text)[:max_bubbles])
 
 
 def is_artifact(text):
@@ -287,6 +347,34 @@ def cap_duplicate_targets(examples, max_exact=MAX_EXACT_TARGET, max_short=MAX_SH
         dropped += max(0, len(rows) - limit)
     kept.sort(key=lambda row: (row.get("_date") or 0, str(row.get("_id") or "")))
     return kept, dropped
+
+
+def cap_low_signal_share(examples, max_share=1.0, rng=None):
+    """Hold ack replies to at most ``max_share`` of the training rows.
+
+    A model trained by maximum likelihood then decoded greedily amplifies its
+    safest mode. Measured here: the adapter produces acks at about twice the
+    rate of the gold replies. Training below the true rate cancels that
+    amplification, so the output rate lands near the real one.
+
+    Keeps the most recent acks, because those carry current habits.
+    """
+    if max_share >= 1.0 or not examples:
+        return examples, 0
+    low = [row for row in examples if is_low_signal(row.get("_reply") or "")]
+    rich = [row for row in examples if not is_low_signal(row.get("_reply") or "")]
+    if not low:
+        return examples, 0
+    # Solve keep / (keep + len(rich)) = max_share for keep.
+    allowed = int(max_share * len(rich) / max(1e-9, 1.0 - max_share))
+    if allowed >= len(low):
+        return examples, 0
+    low.sort(key=lambda row: row.get("_date") or 0, reverse=True)
+    kept = low[:allowed]
+    dropped = len(low) - len(kept)
+    out = rich + kept
+    out.sort(key=lambda row: (row.get("_date") or 0, str(row.get("_id") or "")))
+    return out, dropped
 
 
 def downsample_recency(examples, rng=None, floor=RECENCY_FLOOR):
@@ -450,6 +538,27 @@ def list_subjects():
         conn.close()
 
 
+def chat_sender_names(conn, chat_id):
+    """Display name for each handle in a group chat, empty for a direct chat.
+
+    A direct chat needs no labels: one other person owns every incoming turn.
+    """
+    rows = conn.execute(
+        """SELECT h.id FROM chat_handle_join chj
+           JOIN handle h ON h.ROWID = chj.handle_id
+           WHERE chj.chat_id = ?""",
+        (chat_id,),
+    ).fetchall()
+    handles = [row[0] for row in rows if row[0]]
+    if len(handles) < 2:
+        return {}
+    names = {}
+    for handle in handles:
+        label = (resolve_contact(handle) or "").strip() or handle
+        names[handle] = label.split()[0][:24]
+    return names
+
+
 def collapse_turns(pairs):
     """Merge consecutive bubbles from the same sender when they are close in time."""
     turns = []
@@ -560,7 +669,34 @@ def _context_window(turns, end, max_turns=CONTEXT_TURNS):
     return merged
 
 
-def examples_from_turns(turns, system=SYSTEM, augment=False, opener=OPENER_PROMPT):
+SENDER_RE = re.compile(r"^[^\n:]{1,24}: ")
+
+
+def label_senders(turns, names):
+    """Prefix each incoming turn with who sent it.
+
+    A group chat puts several people in the `user` role, so without this the
+    model cannot tell who is speaking and cannot hold a thread with more than
+    one person. Group chats hold about a third of the sent messages in a typical
+    database, so this is the largest untapped source.
+
+    The trained voice is never labelled. The twin must emit the message text
+    alone.
+    """
+    out = []
+    for turn in turns:
+        item = dict(turn)
+        if item["role"] == "user":
+            who = names.get(item.get("_sender") or "")
+            if who and not SENDER_RE.match(item["content"] or ""):
+                item["content"] = f"{who}: {item['content']}"
+        out.append(item)
+    return out
+
+
+def examples_from_turns(
+    turns, system=SYSTEM, augment=False, opener=OPENER_PROMPT, depth_ladder=()
+):
     """Build one target for every reply that has incoming context in this session.
 
     ``augment`` is ignored: each target is written once. ``opener`` is unused;
@@ -574,14 +710,72 @@ def examples_from_turns(turns, system=SYSTEM, augment=False, opener=OPENER_PROMP
         window = _context_window(turns, i)
         if window is None:
             continue
+        depths = [CONTEXT_TURNS]
+        if depth_ladder:
+            # A shallow copy of the same target. Almost every row carries a full
+            # context window, yet the first message of every real chat has
+            # exactly one turn. Rotating the extra depth by
+            # position keeps each target to two copies instead of four.
+            # The ladder is written in context turns, which is what the data
+            # audit reports. `_context_window` counts the target too, so a
+            # ladder value of 1 means `max_turns=2`. Passing 1 straight through
+            # asked for a window holding only the target and produced nothing.
+            shallow = depth_ladder[i % len(depth_ladder)] + 1
+            if shallow < CONTEXT_TURNS:
+                depths.append(shallow)
+        seen = set()
+        for depth in depths:
+            view = _context_window(turns, i, max_turns=depth)
+            if view is None:
+                continue
+            key = len(view)
+            if key in seen:
+                continue
+            seen.add(key)
+            examples.append(
+                {
+                    "messages": [{"role": "system", "content": system}] + view,
+                    "_sid": None,
+                    "_date": turn.get("_date") or 0,
+                    "_id": turn.get("_id"),
+                    "_query": view[-2]["content"],
+                    "_reply": view[-1]["content"],
+                }
+            )
+    return examples
+
+
+def opener_examples(turns, system=SYSTEM, name=None):
+    """Targets for the messages that open a session.
+
+    Thousands of sent turns start a conversation with nothing before them, so
+    `_context_window` drops every one. The twin therefore never learns to text
+    first, which roleplay needs. The prompt stands in for the missing incoming
+    message.
+    """
+    examples = []
+    for i, turn in enumerate(turns):
+        if turn["role"] != "assistant":
+            continue
+        if _context_window(turns, i) is not None:
+            continue
+        reply = (turn.get("content") or "").strip()
+        if not reply:
+            continue
+        prompt = opener_for(name)
         examples.append(
             {
-                "messages": [{"role": "system", "content": system}] + window,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": reply},
+                ],
                 "_sid": None,
                 "_date": turn.get("_date") or 0,
                 "_id": turn.get("_id"),
-                "_query": window[-2]["content"],
-                "_reply": window[-1]["content"],
+                "_query": prompt,
+                "_reply": reply,
+                "_opener": True,
             }
         )
     return examples
@@ -627,8 +821,69 @@ def fit_messages(messages, tokenizer, max_seq_length=MAX_SEQ_LENGTH, chat_templa
             return None
 
 
-def partition_examples(examples, train_frac=TRAIN_FRACTION, valid_frac=VALID_FRACTION):
-    """Chronological session-level split. Augmented copies of a target stay together."""
+CHUNK_ROWS = 80
+
+
+def chunk_sessions(groups, order):
+    """Cut a long session into chunks so the split has a fine enough unit.
+
+    A session is the only leak-free unit, but sessions are very unequal. One
+    measured contact had 41 sessions whose 5 largest held 88% of the rows, so no
+    session-level split can hit 80/10/10 and stay representative. Chunking gives
+    units of a similar size instead.
+
+    Also returns the previous chunk of the same session for each chunk, so the
+    caller can drop the rows whose context reaches back over a cut. Trimming
+    after assignment costs nothing when both sides of a cut share a split.
+    """
+    chunked, new_order, previous = {}, [], {}
+    for sid in order:
+        rows = sorted(groups[sid], key=lambda ex: ex.get("_date") or 0)
+        last = None
+        for start in range(0, len(rows), CHUNK_ROWS):
+            key = (sid, start)
+            chunked[key] = rows[start : start + CHUNK_ROWS]
+            previous[key] = last
+            new_order.append(key)
+            last = key
+    return chunked, new_order, previous
+
+
+def stratified_ids(order, sizes, train_frac, valid_frac):
+    """Spread the holdout over the whole history, and size it by rows.
+
+    Walks the units oldest first and sends each one to whichever split is
+    furthest below its row quota, so both the size and the era mix come out
+    right.
+    """
+    total = sum(sizes)
+    quota = {
+        "train": train_frac * total,
+        "valid": valid_frac * total,
+        "test": max(0.0, 1.0 - train_frac - valid_frac) * total,
+    }
+    got = {"train": 0, "valid": 0, "test": 0}
+    assigned = {"train": set(), "valid": set(), "test": set()}
+    for sid, size in zip(order, sizes):
+        name = max(quota, key=lambda k: (quota[k] - got[k]) / max(1.0, quota[k]))
+        assigned[name].add(sid)
+        got[name] += size
+    if not assigned["train"]:
+        return None
+    return assigned
+
+
+def partition_examples(
+    examples,
+    train_frac=TRAIN_FRACTION,
+    valid_frac=VALID_FRACTION,
+    strategy="chrono",
+):
+    """Session-level split. Augmented copies of a target stay together.
+
+    ``chrono`` holds out the newest sessions. ``stratified`` spreads the
+    holdout over the whole history and sizes it by rows.
+    """
     groups = {}
     order = []
     for i, example in enumerate(examples):
@@ -646,6 +901,24 @@ def partition_examples(examples, train_frac=TRAIN_FRACTION, valid_frac=VALID_FRA
         )
     )
     n = len(order)
+    if strategy == "stratified" and n >= 10:
+        pieces, piece_order, previous = chunk_sessions(groups, order)
+        assigned = stratified_ids(
+            piece_order,
+            [len(pieces[key]) for key in piece_order],
+            train_frac,
+            valid_frac,
+        )
+        if assigned:
+            where = {key: name for name, ids in assigned.items() for key in ids}
+            for key in piece_order:
+                before = previous.get(key)
+                if before is not None and where[before] != where[key]:
+                    pieces[key] = pieces[key][CONTEXT_TURNS:]
+            return {
+                name: [row for key in piece_order if key in ids for row in pieces[key]]
+                for name, ids in assigned.items()
+            }
     if n < 10:
         n_test = 1 if n >= 3 else 0
         n_valid = 1 if n >= 2 else 0
@@ -761,7 +1034,52 @@ def write_dataset(examples, out_dir, train=None, valid=None, test=None):
         if row.get("_query") and row.get("_reply")
     ]
     write_jsonl(os.path.join(out_dir, "retrieve.jsonl"), retrieve_rows)
+    write_multiturn(out_dir, valid or [])
     return len(train_rows), len(valid or []), len(test or [])
+
+
+MULTITURN_DEPTHS = (2, 3, 4, 6)
+MULTITURN_PER_DEPTH = 40
+
+
+def write_multiturn(out_dir, valid):
+    """Persist a depth-stratified multi-turn holdout.
+
+    Single-reply scoring hides the failure that matters, and picking windows
+    opportunistically means each run scores a different mix of conversation
+    lengths. This fixes the set: the same windows every time, balanced over
+    depth, so a change at 6 turns is not hidden by a change at 2.
+
+    Depth is the number of my turns the model must generate in one window. The
+    rows come from `valid` only, so they carry the split already in force.
+    """
+    by_depth = {}
+    for row in valid:
+        messages = row.get("messages") or []
+        depth = sum(1 for m in messages if m.get("role") == "assistant")
+        for bucket in MULTITURN_DEPTHS:
+            if depth >= bucket:
+                by_depth.setdefault(bucket, []).append(row)
+    rows = []
+    seen = set()
+    rng = random.Random(0)
+    for bucket in MULTITURN_DEPTHS:
+        pool = by_depth.get(bucket) or []
+        rng.shuffle(pool)
+        taken = 0
+        for row in pool:
+            key = id(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            item = public_example(row)
+            item["depth"] = bucket
+            rows.append(item)
+            taken += 1
+            if taken >= MULTITURN_PER_DEPTH:
+                break
+    write_jsonl(os.path.join(out_dir, "multiturn.jsonl"), rows)
+    return len(rows)
 
 
 def conversation_ids(conn, newest_first=False, chat_ids=None):
@@ -865,6 +1183,9 @@ def collect_examples(
     max_seq_length=MAX_SEQ_LENGTH,
     chat_template_args=None,
     include_groups=False,
+    sender_labels=True,
+    depth_ladder=(),
+    openers=False,
 ):
     """Collect one reply example per authentic sent turn in 1:1 sessions."""
     del augment
@@ -898,13 +1219,27 @@ def collect_examples(
         sent_turns += len(sent)
         sent_texts += sum(1 for pair in pairs if pair[0] and pair[1] != MEDIA_MARK)
         peer = None if include_groups else chat_peer_label(conn, chat_id, target_key)
+        group_names = (
+            chat_sender_names(conn, chat_id)
+            if include_groups and sender_labels
+            else {}
+        )
+        if group_names:
+            turns = label_senders(turns, group_names)
         for session_i, session in enumerate(sessionize(turns)):
             sessions_n += 1
             sid = (chat_id, session_i)
             for i, turn in enumerate(session):
                 if turn["role"] == "assistant" and _context_window(session, i) is None:
                     opener_turns += 1
-            rows = examples_from_turns(session, system=system_for(name, peer=peer))
+            rows = examples_from_turns(
+                session,
+                system=system_for(name, peer=peer),
+                depth_ladder=depth_ladder,
+            )
+            rows += opener_examples(
+                session, system=system_for(name, peer=peer), name=name
+            ) if openers else []
             for row in rows:
                 query = row.get("_query") or ""
                 reply = row.get("_reply") or ""
@@ -1049,6 +1384,13 @@ def export_dataset(
     max_seq_length=MAX_SEQ_LENGTH,
     chat_template_args=None,
     include_groups=False,
+    sender_labels=True,
+    depth_ladder=(),
+    openers=False,
+    train_shots=True,
+    recency_floor=RECENCY_FLOOR,
+    low_signal_share=1.0,
+    split_strategy="chrono",
 ):
     """Write MLX JSONL splits and return detailed coverage counts."""
     del augment
@@ -1066,6 +1408,9 @@ def export_dataset(
             max_seq_length=max_seq_length,
             chat_template_args=chat_template_args,
             include_groups=include_groups,
+            sender_labels=sender_labels,
+            depth_ladder=depth_ladder,
+            openers=openers,
         )
     finally:
         conn.close()
@@ -1074,17 +1419,29 @@ def export_dataset(
         raise RuntimeError(
             f"No text from {who} to export. Grant Full Disk Access if chat.db is blocked."
         )
-    split = partition_examples(examples)
+    split = partition_examples(examples, strategy=split_strategy)
     raw_train = list(split["train"])
     concentration = target_concentration(raw_train)
     split["train"], capped = cap_duplicate_targets(split["train"])
-    split["train"], recency_dropped = downsample_recency(split["train"])
-    split["train"], train_with_shots = inject_train_shots(
-        split["train"],
-        tokenizer=tokenizer,
-        max_seq_length=max_seq_length,
-        chat_template_args=chat_template_args,
+    split["train"], recency_dropped = downsample_recency(
+        split["train"], floor=recency_floor
     )
+    split["train"], low_signal_dropped = cap_low_signal_share(
+        split["train"], max_share=low_signal_share
+    )
+    # Shots are prepended to training prompts only. That erases the short
+    # contexts the depth ladder creates, leaving train with almost no one-turn
+    # rows while valid keeps thousands, and it disagrees with chat, where
+    # retrieval measured harmful and is off.
+    if train_shots:
+        split["train"], train_with_shots = inject_train_shots(
+            split["train"],
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+            chat_template_args=chat_template_args,
+        )
+    else:
+        train_with_shots = 0
     n_train, n_valid, n_test = write_dataset(
         examples, out_dir, train=split["train"], valid=split["valid"], test=split["test"]
     )
@@ -1103,6 +1460,10 @@ def export_dataset(
         "top20_share": concentration["top20_share"],
         "capped_targets": capped,
         "recency_dropped": recency_dropped,
+        "recency_floor": recency_floor,
+        "split_strategy": split_strategy,
+        "low_signal_share": low_signal_share,
+        "low_signal_dropped": low_signal_dropped,
         "train_with_shots": train_with_shots,
         "bubble_tokens": bubble_pieces,
     }
@@ -1127,6 +1488,45 @@ def main():
         help="me, or a phone number / email to train as that contact",
     )
     parser.add_argument("--model-key", default="", help="Tokenizer to fit examples to")
+    parser.add_argument(
+        "--recency-floor",
+        type=float,
+        default=RECENCY_FLOOR,
+        help="Lowest keep probability for an old train session. 1.0 keeps every session.",
+    )
+    parser.add_argument(
+        "--depth-ladder",
+        default="",
+        help="Extra shallow context depths, e.g. 1,3,5. Empty keeps one copy per reply.",
+    )
+    parser.add_argument(
+        "--no-train-shots",
+        action="store_true",
+        help="Do not prepend retrieved pairs to training prompts",
+    )
+    parser.add_argument(
+        "--openers",
+        action="store_true",
+        help="Include conversation starters, which have no incoming message",
+    )
+    parser.add_argument(
+        "--no-sender-labels",
+        action="store_true",
+        help="Do not prefix group turns with the sender name",
+    )
+    parser.add_argument(
+        "--split",
+        choices=("chrono", "stratified"),
+        default="chrono",
+        help="chrono holds out the newest sessions. stratified spreads the "
+        "holdout over the whole history and sizes it by rows.",
+    )
+    parser.add_argument(
+        "--low-signal-share",
+        type=float,
+        default=1.0,
+        help="Cap ack replies at this share of the training rows. 1.0 keeps all.",
+    )
     args = parser.parse_args()
 
     try:
@@ -1143,6 +1543,13 @@ def main():
             name=subject["name"],
             model_key=args.model_key or None,
             include_groups=args.groups,
+            sender_labels=not args.no_sender_labels,
+            depth_ladder=tuple(int(x) for x in args.depth_ladder.split(",") if x.strip()),
+            openers=args.openers,
+            train_shots=not args.no_train_shots,
+            recency_floor=args.recency_floor,
+            low_signal_share=args.low_signal_share,
+            split_strategy=args.split,
         )
     except RuntimeError as e:
         sys.exit(str(e))

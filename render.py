@@ -2043,8 +2043,10 @@ def render_twin():
     def checkpoint_label(ckpt):
         if ckpt.get("step") == "latest":
             n = ckpt.get("step_n") or 0
-            return f"Latest · {int(n):,} steps" if n else "Latest"
-        return f'Step {int(ckpt["step_n"] or ckpt["step"]):,}'
+            base = f"Latest · {int(n):,} steps" if n else "Latest"
+        else:
+            base = f'Step {int(ckpt["step_n"] or ckpt["step"]):,}'
+        return f"{base} · best on holdout" if ckpt.get("recommended") else base
 
     def options_for_runs(runs, selected_id=""):
         chunks = []
@@ -2085,8 +2087,14 @@ def render_twin():
         for category, options in model_groups.items()
     )
     first_chat = ""
-    if adapter_runs and adapter_runs[0].get("checkpoints"):
-        first_chat = adapter_runs[0]["checkpoints"][0]["id"]
+    # Open on the best-scoring run, not the newest one. The 8B trained last and
+    # lost to the 4B, 1.705 against 1.219 on style distance.
+    chattable = [run for run in adapter_runs if run.get("checkpoints")]
+    scored = [run for run in chattable if run.get("recommended_score")]
+    if scored:
+        first_chat = min(scored, key=lambda run: run["recommended_score"])["checkpoints"][0]["id"]
+    elif chattable:
+        first_chat = chattable[0]["checkpoints"][0]["id"]
     chat_options = options_for_runs(adapter_runs, first_chat)
     resume_runs = [run for run in adapter_runs if run.get("model") == selected_model]
     resume_options = '<option value="" selected>Fresh weights</option>' + options_for_runs(

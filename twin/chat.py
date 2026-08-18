@@ -21,6 +21,7 @@ from twin.export import (
     coerce_chat,
     parse_person_arg,
     resolve_subject,
+    strip_scaffold,
     system_for,
 )
 from twin.retrieve import RETRIEVE_K, load_index, with_retrieved_shots
@@ -37,10 +38,20 @@ def load_model(model, adapter):
         )
     if not os.path.isfile(os.path.join(adapter, "adapters.safetensors")):
         sys.exit("No adapter exists for this model. Train it on the Twin page.")
-    return load(model, adapter_path=adapter)
+    from twin.export import sanitize_chat_template
+
+    model_obj, tokenizer = load(model, adapter_path=adapter)
+    sanitize_chat_template(tokenizer)
+    return model_obj, tokenizer
 
 
-def generate_kwargs(max_tokens, temp=CHAT_TEMP, top_p=CHAT_TOP_P, seed=0):
+def generate_kwargs(
+    max_tokens,
+    temp=CHAT_TEMP,
+    top_p=CHAT_TOP_P,
+    seed=0,
+    repetition_penalty=None,
+):
     """Sampler for Twin decoding. The bubble cap stops delimiter loops."""
     kwargs = {"max_tokens": max_tokens}
     if temp and temp > 0:
@@ -49,10 +60,11 @@ def generate_kwargs(max_tokens, temp=CHAT_TEMP, top_p=CHAT_TOP_P, seed=0):
 
         mx.random.seed(seed)
         kwargs["sampler"] = make_sampler(temp, top_p=top_p)
-    if REPETITION_PENALTY and abs(REPETITION_PENALTY - 1.0) > 1e-6:
+    penalty = REPETITION_PENALTY if repetition_penalty is None else repetition_penalty
+    if penalty and abs(penalty - 1.0) > 1e-6:
         from mlx_lm.sample_utils import make_logits_processors
 
-        processors = make_logits_processors(repetition_penalty=REPETITION_PENALTY)
+        processors = make_logits_processors(repetition_penalty=penalty)
         if processors:
             kwargs["logits_processors"] = processors
     return kwargs
@@ -78,7 +90,7 @@ def complete(
     )
     kwargs = generate_kwargs(max_tokens, temp=temp, top_p=top_p, seed=seed)
     text = generate(model, tokenizer, prompt=prompt, **kwargs)
-    return clip_bubbles((text or "").strip(), MAX_BUBBLES)
+    return clip_bubbles(strip_scaffold(text), MAX_BUBBLES)
 
 
 def _with_retrieval(messages, text, enabled, peer=None):

@@ -27,6 +27,7 @@ from twin.export import (
     TWIN_DIR,
     clip_bubbles,
     peer_from_system,
+    strip_scaffold,
     split_bubbles,
     system_for,
 )
@@ -68,8 +69,14 @@ def _ngrams(text, n):
     return Counter("".join(chars[i : i + n]) for i in range(len(chars) - n + 1))
 
 
-def chr_f(pred, gold, max_n=6, beta=2.0):
-    """Character n-gram F-score. Higher is better."""
+def chr_f(pred, gold, max_n=6, beta=1.0):
+    """Character n-gram F-score. Higher is better.
+
+    Beta is 1.0, so precision and recall weigh the same. The earlier 2.0
+    weighted recall four times, which paid a model for writing long. Under
+    that setting "repeat the incoming message twice" scored −0.037 against
+    −0.011 for the untrained 4B, so a degenerate strategy tied a real model.
+    """
     pred = pred or ""
     gold = gold or ""
     if not pred or not gold:
@@ -134,6 +141,22 @@ def style_stats(text):
     }
 
 
+COPY_MIN_CHARS = 20
+
+
+def copied_from_prompt(pred, prompt):
+    """True when the reply repeats a substantial span of the prompt.
+
+    A bare substring test punished the style we are training for. Replies such
+    as "ok", "kk" and "LMAO" appear inside any long multi-turn prompt by
+    chance, and the flagged predictions had a median length of 4 characters.
+    The real fault is parroting a whole incoming message, so the test needs a
+    minimum length. Gold replies trip this at 0%, against 1% for the bare test.
+    """
+    pred = (pred or "").strip()
+    return len(pred) >= COPY_MIN_CHARS and pred in (prompt or "")
+
+
 def score_reply(pred, gold, prompt="", hit_limit=False):
     pred = (pred or "").strip()
     gold = (gold or "").strip()
@@ -146,7 +169,7 @@ def score_reply(pred, gold, prompt="", hit_limit=False):
         "len_ratio": pred_stats["chars"] / gold_len,
         "bubble_delta": pred_stats["bubbles"] - gold_stats["bubbles"],
         "emoji_delta": pred_stats["emoji"] - gold_stats["emoji"],
-        "copied_history": bool(pred) and pred in (prompt or ""),
+        "copied_history": copied_from_prompt(pred, prompt),
         "exact": pred == gold,
         "hit_limit": bool(hit_limit),
         "text": pred,
@@ -155,11 +178,21 @@ def score_reply(pred, gold, prompt="", hit_limit=False):
     }
 
 
+LENGTH_PENALTY = 0.5
+
+
 def ranking_score(row):
-    """Scalar used to pick a checkpoint. Higher is better."""
+    """Scalar used to pick a checkpoint. Higher is better.
+
+    The length weight is 0.5. At the earlier 0.15 the penalty could not offset
+    the recall bonus that a long reply collects, so padding was profitable.
+    Checked against fixed strategies on 200 valid examples: gold +1.290,
+    echo the incoming message −0.365, echo it twice −0.496, echo it four times
+    −0.746, constant "kk" −1.241, empty −1.498.
+    """
     length_pen = abs(math.log(max(0.05, min(20.0, row["len_ratio"]))))
     copied = 1.0 if row["copied_history"] else 0.0
-    return row["chrf"] + 0.3 * row["rouge_l"] - 0.15 * length_pen - copied
+    return row["chrf"] + 0.3 * row["rouge_l"] - LENGTH_PENALTY * length_pen - copied
 
 
 def load_jsonl(path):
@@ -340,7 +373,7 @@ def smoke_template(tokenizer, chat_template_args=None, name="You"):
     return True
 
 
-def generate_reply(model, tokenizer, messages, chat_template_args=None, max_tokens=96, temp=0.0, top_p=CHAT_TOP_P, seed=0):
+def generate_reply(model, tokenizer, messages, chat_template_args=None, max_tokens=96, temp=0.0, top_p=CHAT_TOP_P, seed=0, repetition_penalty=None):
     from mlx_lm import generate
     from twin.chat import generate_kwargs
 
@@ -350,7 +383,10 @@ def generate_reply(model, tokenizer, messages, chat_template_args=None, max_toke
         add_generation_prompt=True,
         **(chat_template_args or {}),
     )
-    kwargs = generate_kwargs(max_tokens, temp=temp, top_p=top_p, seed=seed)
+    kwargs = generate_kwargs(
+        max_tokens, temp=temp, top_p=top_p, seed=seed,
+        repetition_penalty=repetition_penalty,
+    )
     raw = generate(model, tokenizer, prompt=prompt, **kwargs)
     text = (raw or "").strip()
     n_tok = 0
@@ -359,7 +395,7 @@ def generate_reply(model, tokenizer, messages, chat_template_args=None, max_toke
             n_tok = len(tokenizer.encode(text))
         except Exception:
             n_tok = 0
-    return clip_bubbles(text), n_tok >= max(1, max_tokens) - 1
+    return clip_bubbles(strip_scaffold(text)), n_tok >= max(1, max_tokens) - 1
 
 
 def evaluate_split(
@@ -374,6 +410,7 @@ def evaluate_split(
     seed=0,
     max_examples=0,
     max_tokens=96,
+    repetition_penalty=None,
 ):
     rows = examples[:max_examples] if max_examples else examples
     scored = []
@@ -390,6 +427,7 @@ def evaluate_split(
             temp=temp,
             top_p=top_p,
             seed=seed + i,
+            repetition_penalty=repetition_penalty,
         )
         row = score_reply(pred, gold, prompt, hit_limit=hit_limit)
         system = (example.get("messages") or [{}])[0].get("content") or ""
@@ -398,14 +436,15 @@ def evaluate_split(
     return summarize(scored), scored
 
 
-def _load_mlx(model_key, adapter_path=None):
-    from mlx_lm import load
+def _load_mlx(model_key, adapter_path=None, backend=None):
+    """Load through `twin.backends`. The name is kept for its six call sites.
 
-    config = model_config(model_key)
-    kwargs = {}
-    if adapter_path:
-        kwargs["adapter_path"] = adapter_path
-    return load(config["repo"], **kwargs), config
+    Only loading and generation are backend-specific. Scoring always runs where
+    the results log is, so every row shares one metric version.
+    """
+    from twin.backends import load
+
+    return load(model_key, adapter_path, backend=backend)
 
 
 def score_checkpoints(

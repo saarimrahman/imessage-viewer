@@ -3,13 +3,16 @@
 import importlib.util
 import json
 import os
+import random
 import re
 import shutil
 import signal
 import threading
 import time
 
+from twin.style import is_degenerate, trim_degenerate
 from twin.export import (
+    CHAT_REPETITION_PENALTY,
     CHAT_TEMP,
     CHAT_TOP_P,
     CONTEXT_TURNS,
@@ -21,6 +24,7 @@ from twin.export import (
     list_subjects,
     parse_person_arg,
     resolve_subject,
+    strip_scaffold,
     system_for,
 )
 from twin.train import (
@@ -32,6 +36,7 @@ from twin.train import (
     QUICK_LR,
     TWIN_DIR,
     adapter_dir,
+    data_dir,
     epochs_for,
     grad_accumulation_for,
     hash_train_file,
@@ -606,6 +611,7 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
         stats = export_dataset(
             limit=SMOKE_LIMIT if is_quick else 0,
             per_chat=240 if is_quick else 0,
+            out_dir=data_dir(subject["id"]),
             target_key=subject["key"],
             name=subject["name"],
             model_key=model_key,
@@ -621,7 +627,7 @@ def _train_worker_exclusive(run, model_key, subject, custom_iters=None, resume=N
                 epochs=epochs_for(config, complete=True),
             )
         )
-        data_hash = hash_train_file(TWIN_DIR)
+        data_hash = hash_train_file(data_dir(subject["id"]))
         created = time.time()
         root = adapter_dir(model_key, subject["id"])
         os.makedirs(root, exist_ok=True)
@@ -806,7 +812,7 @@ def _finish_ready(target_adapter, metadata, tracker, early, iters):
             _set(detail="Scoring holdout replies…")
             scored = score_checkpoints(
                 target_adapter,
-                TWIN_DIR,
+                data_dir(subject["id"]),
                 metadata.get("model") or DEFAULT_MODEL,
                 split="valid",
                 max_examples=RANK_EXAMPLES,
@@ -865,7 +871,10 @@ def _load_model(model_key, person_id=ME, run_id=None, step="latest"):
     try:
         from mlx_lm import load
 
+        from twin.export import sanitize_chat_template
+
         model, tokenizer = load(config["repo"], adapter_path=adapter_path)
+        sanitize_chat_template(tokenizer)
     except Exception as e:
         raise TwinError(f"Could not load {config['name']}: {e}") from e
     with _lock:
@@ -879,7 +888,9 @@ def chat(
     model_key=DEFAULT_MODEL,
     person_id=ME,
     adapter=None,
-    retrieve_pairs=True,
+    # Measured worse: retrieval k=2 raises style distance from 1.219 to 1.754
+    # and cuts the median reply length to about two thirds of the gold median.
+    retrieve_pairs=False,
     temp=CHAT_TEMP,
     top_p=CHAT_TOP_P,
     to=None,
@@ -915,7 +926,7 @@ def chat(
         live.append({"role": "user", "content": text})
         messages = with_retrieved_shots(
             messages + live,
-            load_index(TWIN_DIR) if retrieve_pairs else [],
+            load_index(data_dir(person_id)) if retrieve_pairs else [],
             k=RETRIEVE_K if retrieve_pairs else 0,
             exclude=[text],
             peer=to,
@@ -928,8 +939,31 @@ def chat(
             **config.get("chat_template_args", {}),
         )
         try:
-            kwargs = generate_kwargs(96, temp=temp, top_p=top_p, seed=0)
-            return clip_bubbles(generate(model, tokenizer, prompt=prompt, **kwargs).strip())
+            # A fine-tuned adapter loops on the delimiter without this penalty.
+            # It measured worse on the untrained model, so it stays out of the
+            # neutral default in export.py and is set here, where an adapter is
+            # always loaded.
+            # A fixed seed replays the same sampler draws on every message. With
+            # its own last reply in the context the model then repeats that
+            # reply verbatim, turn after turn. Chat wants variety, so the seed
+            # varies. `bench.py` and `eval.py` still pass an explicit seed.
+            # Repetition spam survives the decode penalty, so the reply is
+            # checked and drawn again. Each retry raises the penalty. Three
+            # tries is enough: the rate is under 1% for one draw.
+            reply = ""
+            for attempt in range(3):
+                kwargs = generate_kwargs(
+                    96,
+                    temp=temp,
+                    top_p=top_p,
+                    seed=random.randrange(1 << 30),
+                    repetition_penalty=CHAT_REPETITION_PENALTY + 0.1 * attempt,
+                )
+                text_out = generate(model, tokenizer, prompt=prompt, **kwargs)
+                reply = clip_bubbles(strip_scaffold(text_out).strip())
+                if not is_degenerate(reply):
+                    return reply
+            return trim_degenerate(reply)
         except Exception as e:
             with _lock:
                 _drop_model_locked()
