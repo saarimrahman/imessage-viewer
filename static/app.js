@@ -245,90 +245,199 @@
   }
 
   function initMediaRail() {
-    const sections = Array.from(document.querySelectorAll(".media-month"));
     const rail = document.getElementById("mediaRail");
-    if (!sections.length || !rail) return;
+    if (!rail || !rail.dataset.min || !rail.dataset.max) return;
     const track = document.getElementById("mediaRailTrack");
     const dot = document.getElementById("mediaRailDot");
     const label = document.getElementById("mediaRailLabel");
+    const jump = rail.dataset.jump || "/media";
+    const t0 = Date.parse(rail.dataset.min + "T00:00:00");
+    const t1 = Date.parse(rail.dataset.max + "T00:00:00");
+    const span = Math.max(1, t1 - t0);
+    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     let dragging = false;
+    let lastFrac = 0;
 
-    function docHeight() {
-      return Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+    function fracOf(dateStr) {
+      return Math.min(1, Math.max(0, (Date.parse(dateStr + "T00:00:00") - t0) / span));
     }
-
-    function layoutTicks() {
-      track.querySelectorAll(".media-rail-tick").forEach((t) => t.remove());
-      const total = document.documentElement.scrollHeight;
-      let lastYear = null;
-      sections.forEach((sec) => {
-        const year = sec.dataset.year;
-        if (year !== lastYear) {
-          lastYear = year;
-          const tick = document.createElement("div");
-          tick.className = "media-rail-tick";
-          tick.style.top = (sec.offsetTop / total) * 100 + "%";
-          tick.textContent = year;
-          track.appendChild(tick);
-        }
-      });
+    function dateAt(frac) {
+      const d = new Date(t0 + frac * span);
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return d.getFullYear() + "-" + m + "-" + day;
     }
-
-    function sectionAtFrac(frac) {
-      const targetTop = frac * docHeight();
-      let cur = sections[0];
-      for (const sec of sections) {
-        if (sec.offsetTop <= targetTop + 60) cur = sec;
-        else break;
+    function monthLabel(frac) {
+      const d = new Date(t0 + frac * span);
+      return months[d.getMonth()] + " " + d.getFullYear();
+    }
+    function fracFromEvent(e) {
+      const rect = track.getBoundingClientRect();
+      return Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    }
+    function visibleMonth() {
+      for (const sec of document.querySelectorAll(".media-month")) {
+        const top = sec.getBoundingClientRect().top;
+        if (top > -sec.offsetHeight + 80) return sec;
       }
-      return cur;
+      return document.querySelector(".media-month");
+    }
+    function setDot(frac) {
+      dot.style.top = frac * 100 + "%";
+    }
+    function showLabel(frac) {
+      lastFrac = frac;
+      label.textContent = monthLabel(frac);
+      label.style.top = frac * 100 + "%";
+      rail.classList.add("active");
+    }
+    function updateDot() {
+      const sec = visibleMonth();
+      if (!sec || !sec.dataset.month) return;
+      setDot(fracOf(sec.dataset.month + "-01"));
     }
 
-    function updateDot() {
-      const frac = window.scrollY / docHeight();
-      dot.style.top = frac * 100 + "%";
+    const startYear = new Date(t0).getFullYear();
+    const endYear = new Date(t1).getFullYear();
+    for (let y = startYear; y <= endYear; y++) {
+      const frac = fracOf(y + "-01-01");
+      const tick = document.createElement("div");
+      tick.className = "media-rail-tick";
+      tick.style.top = frac * 100 + "%";
+      tick.textContent = y;
+      track.appendChild(tick);
     }
 
     let ticking = false;
     window.addEventListener("scroll", () => {
-      if (!ticking) {
-        requestAnimationFrame(() => {
-          updateDot();
-          ticking = false;
-        });
-        ticking = true;
-      }
-    });
-    window.addEventListener("resize", layoutTicks);
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        updateDot();
+        ticking = false;
+      });
+    }, { passive: true });
 
     track.addEventListener("mousemove", (e) => {
-      const rect = track.getBoundingClientRect();
-      const frac = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-      const sec = sectionAtFrac(frac);
-      label.textContent = sec.dataset.label;
-      label.style.top = frac * 100 + "%";
-      rail.classList.add("active");
-      if (dragging) window.scrollTo(0, frac * docHeight());
+      showLabel(fracFromEvent(e));
     });
     track.addEventListener("mouseleave", () => {
       if (!dragging) rail.classList.remove("active");
     });
     track.addEventListener("mousedown", (e) => {
       dragging = true;
-      const rect = track.getBoundingClientRect();
-      const frac = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-      window.scrollTo(0, frac * docHeight());
+      showLabel(fracFromEvent(e));
+      e.preventDefault();
     });
     window.addEventListener("mouseup", () => {
+      if (!dragging) return;
       dragging = false;
+      rail.classList.remove("active");
+      const next = dateAt(lastFrac);
+      const month = next.slice(0, 7);
+      const sec = document.querySelector('.media-month[data-month="' + month + '"]');
+      if (sec) {
+        sec.scrollIntoView();
+        return;
+      }
+      const url = jump + "?date=" + next;
+      if (location.pathname + location.search !== url) location.href = url;
     });
 
-    window.addEventListener("load", () => {
-      layoutTicks();
-      updateDot();
-    });
-    layoutTicks();
     updateDot();
+  }
+
+  function initMediaPager() {
+    const wrap = document.getElementById("mediaStream");
+    if (!wrap) return;
+    const topSentinel = document.getElementById("mediaSentinelTop");
+    const sentinel = document.getElementById("mediaSentinel");
+    const moreUrl = wrap.dataset.more;
+    let firstDate = wrap.dataset.firstDate;
+    let firstId = Number(wrap.dataset.firstId);
+    let lastDate = wrap.dataset.lastDate;
+    let lastId = Number(wrap.dataset.lastId);
+    let hasOlder = wrap.dataset.hasOlder === "1";
+    let hasNewer = wrap.dataset.hasNewer === "1";
+    let loading = false;
+
+    const olderObs = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) loadOlder();
+    }, { rootMargin: "800px" });
+    const newerObs = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) loadNewer();
+    }, { rootMargin: "800px" });
+
+    function armObservers() {
+      if (hasOlder && topSentinel) olderObs.observe(topSentinel);
+      if (hasNewer && sentinel) newerObs.observe(sentinel);
+    }
+    function isNear(el) {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.top < window.innerHeight + 800 && r.bottom > -800;
+    }
+    function fillIfNeeded() {
+      if (hasNewer && isNear(sentinel)) loadNewer();
+      else if (hasOlder && isNear(topSentinel)) loadOlder();
+    }
+    function mergeMonths() {
+      const months = Array.from(wrap.children).filter((el) => el.classList.contains("media-month"));
+      for (let i = 1; i < months.length; i++) {
+        const prev = months[i - 1];
+        const cur = months[i];
+        if (prev.dataset.month !== cur.dataset.month) continue;
+        const prevGrid = prev.querySelector(".mediagrid");
+        const curGrid = cur.querySelector(".mediagrid");
+        const frag = document.createDocumentFragment();
+        while (prevGrid.firstChild) frag.appendChild(prevGrid.firstChild);
+        curGrid.prepend(frag);
+        prev.remove();
+      }
+    }
+
+    async function loadNewer() {
+      if (loading || !hasNewer) return;
+      loading = true;
+      const res = await fetch(moreUrl + "?after_date=" + lastDate + "&after_id=" + lastId);
+      const data = await res.json();
+      if (data.html) {
+        wrap.insertAdjacentHTML("beforeend", data.html);
+        mergeMonths();
+      }
+      lastDate = data.last_date;
+      lastId = data.last_id;
+      hasNewer = data.has_more_newer;
+      loading = false;
+      if (!hasNewer && sentinel) newerObs.unobserve(sentinel);
+      fillIfNeeded();
+    }
+
+    async function loadOlder() {
+      if (loading || !hasOlder) return;
+      loading = true;
+      const prevHeight = document.documentElement.scrollHeight;
+      const prevScroll = window.scrollY;
+      const res = await fetch(moreUrl + "?before_date=" + firstDate + "&before_id=" + firstId);
+      const data = await res.json();
+      if (data.html) {
+        wrap.insertAdjacentHTML("afterbegin", data.html);
+        mergeMonths();
+        window.scrollTo(0, prevScroll + (document.documentElement.scrollHeight - prevHeight));
+      }
+      firstDate = data.first_date;
+      firstId = data.first_id;
+      hasOlder = data.has_more_older;
+      loading = false;
+      if (!hasOlder && topSentinel) olderObs.unobserve(topSentinel);
+      fillIfNeeded();
+    }
+
+    if (wrap.dataset.jumpEnd === "1") {
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      window.addEventListener("load", () => window.scrollTo(0, document.documentElement.scrollHeight));
+    }
+    requestAnimationFrame(() => requestAnimationFrame(armObservers));
   }
 
   function initChatRail() {
@@ -2308,6 +2417,7 @@
   initCountup();
   initTileDurations();
   initMediaSize();
+  initMediaPager();
   initMediaRail();
   initChatRail();
   initLightbox();

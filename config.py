@@ -12,6 +12,7 @@ CONTACTS_GLOBS = [
 ]
 PORT = 8765
 PAGE_SIZE = 150
+MEDIA_PAGE_SIZE = 80
 THUMB_SIZE = 512
 APPLE_EPOCH = 978307200  # 2001-01-01 relative to Unix epoch
 CACHE_CONTROL = "public, max-age=31536000, immutable"

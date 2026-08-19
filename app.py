@@ -57,6 +57,7 @@ from render import (
     render_chat_list,
     render_db_error,
     render_media,
+    render_media_more,
     render_message_blocks,
     render_search,
     render_stats,
@@ -228,7 +229,9 @@ class Handler(BaseHTTPRequestHandler):
             query = qs.get("q", [None])[0]
             self._send_html(render_search(query))
         elif parts[0] == "media" and len(parts) == 1:
-            self._send_html(render_all_media())
+            self._send_html(render_all_media(qs.get("date", [None])[0]))
+        elif parts[0] == "media" and len(parts) == 2 and parts[1] == "more":
+            self._serve_media_more(None, qs)
         elif parts[0] == "chat" and len(parts) == 2:
             try:
                 chat_id = int(parts[1])
@@ -259,8 +262,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send_error(404)
                 return
-            out = render_media(chat_id)
+            out = render_media(chat_id, qs.get("date", [None])[0])
             self._send_html(out) if out is not None else self._send_error(404)
+        elif parts[0] == "chat" and len(parts) == 4 and parts[2] == "media" and parts[3] == "more":
+            try:
+                chat_id = int(parts[1])
+            except ValueError:
+                self._send_error(404)
+                return
+            self._serve_media_more(chat_id, qs)
         elif parts[0] == "chat" and len(parts) == 3 and parts[2] == "search":
             try:
                 chat_id = int(parts[1])
@@ -350,6 +360,32 @@ class Handler(BaseHTTPRequestHandler):
                 "strip_group_start": strip_group_start,
             }
         )
+
+    def _serve_media_more(self, chat_id, qs):
+        def take(key):
+            raw = qs.get(key, [None])[0]
+            if raw in (None, ""):
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+
+        after = before = None
+        after_date, after_id = take("after_date"), take("after_id")
+        before_date, before_id = take("before_date"), take("before_id")
+        if before_date is not None and before_id is not None:
+            before = (before_date, before_id)
+        elif after_date is not None and after_id is not None:
+            after = (after_date, after_id)
+        else:
+            self._send_error(404)
+            return
+        out = render_media_more(chat_id, after=after, before=before)
+        if out is None:
+            self._send_error(404)
+            return
+        self._send_json(out)
 
     def _send_html(self, body, status=200):
         data = body.encode("utf-8")

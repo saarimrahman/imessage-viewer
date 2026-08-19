@@ -936,7 +936,7 @@ a.att-file {
   outline-offset: 2px;
 }
 
-#sentinel, #sentinel-top {
+#sentinel, #sentinel-top, #mediaSentinel, #mediaSentinelTop {
   text-align: center;
   padding: 18px;
   color: var(--faint);

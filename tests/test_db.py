@@ -30,6 +30,8 @@ def make_conn():
             PRIMARY KEY (chat_id, message_id)
         );
         CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER);
+        CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, mime_type TEXT, filename TEXT);
+        CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
         CREATE INDEX chat_message_join_idx_message_date_id_chat_id
             ON chat_message_join (chat_id, message_date, message_id);
         """
@@ -138,3 +140,52 @@ class LoadReactionsTest(unittest.TestCase):
         )
         out = db.load_reactions(self.conn, 1, ["target-a"])
         self.assertEqual(out, {})
+
+
+def add_photo(conn, att_id, date, mime="image/jpeg"):
+    add_message(conn, att_id, date, text=None)
+    conn.execute(
+        "INSERT INTO attachment (ROWID, mime_type, filename) VALUES (?, ?, ?)",
+        (att_id, mime, f"/tmp/{att_id}.jpg"),
+    )
+    conn.execute(
+        "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (?, ?)",
+        (att_id, att_id),
+    )
+
+
+class FetchMediaTest(unittest.TestCase):
+    def setUp(self):
+        db.CHAT_GROUPS = None
+        self.conn = make_conn()
+        for i in range(1, 11):
+            add_photo(self.conn, i, i * 1000)
+
+    def tearDown(self):
+        self.conn.close()
+        db.CHAT_GROUPS = None
+
+    def test_newest_page_is_the_latest_photos(self):
+        rows = db.fetch_media(self.conn, 1, from_end=True, limit=3, visual_only=True)
+        self.assertEqual([r["att_id"] for r in rows], [8, 9, 10])
+
+    def test_after_cursor_walks_forward(self):
+        rows = db.fetch_media(self.conn, 1, after=(3000, 3), limit=2, visual_only=True)
+        self.assertEqual([r["att_id"] for r in rows], [4, 5])
+
+    def test_before_cursor_walks_backward(self):
+        rows = db.fetch_media(self.conn, 1, before=(8000, 8), limit=2, visual_only=True)
+        self.assertEqual([r["att_id"] for r in rows], [6, 7])
+
+    def test_visual_only_drops_files(self):
+        add_photo(self.conn, 20, 20000, mime="application/pdf")
+        rows = db.fetch_media(self.conn, 1, from_end=True, limit=3, visual_only=True)
+        self.assertEqual([r["att_id"] for r in rows], [8, 9, 10])
+        rows = db.fetch_media(self.conn, 1, from_end=True, limit=3, visual_only=False)
+        self.assertEqual([r["att_id"] for r in rows], [9, 10, 20])
+
+    def test_bounds_and_count(self):
+        bounds = db.media_date_bounds(self.conn, 1, visual_only=True)
+        self.assertEqual(bounds["lo"], 1000)
+        self.assertEqual(bounds["hi"], 10000)
+        self.assertEqual(db.media_count(self.conn, 1, visual_only=True), 10)

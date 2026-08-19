@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from config import APPLE_EPOCH, DB_PATH, PAGE_SIZE, SNAPSHOT_DB
+from config import APPLE_EPOCH, DB_PATH, MEDIA_PAGE_SIZE, PAGE_SIZE, SNAPSHOT_DB
 from contacts import person_key, resolve_contact
 
 _snapshot_ready = False
@@ -352,3 +352,102 @@ def fetch_messages_around(conn, chat_id, target_id, half=75):
         chat_params + [tgt_date, tgt_date, target_id, half],
     ).fetchall()
     return list(reversed(before_rows)) + list(after_rows)
+
+
+MEDIA_FILE_SQL = "(att.filename IS NULL OR att.filename NOT LIKE '%.pluginPayloadAttachment')"
+MEDIA_VISUAL_SQL = """(
+  ifnull(att.mime_type, '') LIKE 'image/%'
+  OR ifnull(att.mime_type, '') LIKE 'video/%'
+  OR lower(ifnull(att.filename, '')) LIKE '%.heic'
+  OR lower(ifnull(att.filename, '')) LIKE '%.heif'
+  OR lower(ifnull(att.filename, '')) LIKE '%.mov'
+  OR lower(ifnull(att.filename, '')) LIKE '%.mp4'
+)"""
+MEDIA_FROM = """FROM message_attachment_join maj
+            JOIN attachment att ON att.ROWID = maj.attachment_id
+            JOIN message m ON m.ROWID = maj.message_id
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID"""
+MEDIA_SELECT = (
+    "SELECT att.ROWID as att_id, att.mime_type, att.filename, "
+    "m.ROWID as msg_id, m.date, cmj.chat_id as chat_id "
+    + MEDIA_FROM
+)
+
+
+def _media_filters(conn, chat_id=None, visual_only=False):
+    where = [MEDIA_FILE_SQL]
+    params = []
+    if visual_only:
+        where.append(MEDIA_VISUAL_SQL)
+    if chat_id is not None:
+        chat_sql, chat_params = chat_filter(conn, chat_id)
+        where.append(chat_sql)
+        params.extend(chat_params)
+    return where, params
+
+
+def _media_cursor(op):
+    return f"(m.date {op} ? OR (m.date = ? AND att.ROWID {op} ?))"
+
+
+def fetch_media(
+    conn,
+    chat_id=None,
+    after=None,
+    before=None,
+    start_ns=None,
+    limit=MEDIA_PAGE_SIZE,
+    from_end=False,
+    visual_only=False,
+):
+    """Page by (date, attachment id). `after`/`before` are (date_ns, att_id)."""
+    where, params = _media_filters(conn, chat_id, visual_only)
+    order = "m.date ASC, att.ROWID ASC"
+    if after:
+        date_ns, att_id = after
+        where.append(_media_cursor(">"))
+        params.extend([date_ns, date_ns, att_id])
+    elif before:
+        date_ns, att_id = before
+        where.append(_media_cursor("<"))
+        params.extend([date_ns, date_ns, att_id])
+        order = "m.date DESC, att.ROWID DESC"
+    elif start_ns is not None:
+        where.append("m.date >= ?")
+        params.append(start_ns)
+    elif from_end:
+        order = "m.date DESC, att.ROWID DESC"
+    rows = conn.execute(
+        f"{MEDIA_SELECT} WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?",
+        params + [limit],
+    ).fetchall()
+    if before or from_end:
+        rows = list(reversed(rows))
+    return rows
+
+
+def has_media_neighbor(conn, date_ns, att_id, direction, chat_id=None, visual_only=False):
+    clause = _media_cursor("<" if direction == "before" else ">")
+    where, params = _media_filters(conn, chat_id, visual_only)
+    where.append(clause)
+    params.extend([date_ns, date_ns, att_id])
+    return conn.execute(
+        f"SELECT 1 {MEDIA_FROM} WHERE {' AND '.join(where)} LIMIT 1",
+        params,
+    ).fetchone() is not None
+
+
+def media_date_bounds(conn, chat_id=None, visual_only=False):
+    where, params = _media_filters(conn, chat_id, visual_only)
+    return conn.execute(
+        f"SELECT min(m.date) as lo, max(m.date) as hi {MEDIA_FROM} WHERE {' AND '.join(where)}",
+        params,
+    ).fetchone()
+
+
+def media_count(conn, chat_id=None, visual_only=False):
+    where, params = _media_filters(conn, chat_id, visual_only)
+    return conn.execute(
+        f"SELECT count(DISTINCT att.ROWID) {MEDIA_FROM} WHERE {' AND '.join(where)}",
+        params,
+    ).fetchone()[0]

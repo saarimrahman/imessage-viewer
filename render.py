@@ -8,7 +8,7 @@ import os
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
-from config import DB_PATH, PAGE_SIZE, SCRIPT_DIR, SEARCH_LIMIT, START_NEWEST, load_prefs
+from config import DB_PATH, MEDIA_PAGE_SIZE, PAGE_SIZE, SCRIPT_DIR, SEARCH_LIMIT, START_NEWEST, load_prefs
 from contacts import (
     avatar_html,
     chat_label,
@@ -23,10 +23,14 @@ from db import (
     chat_date_bounds,
     chat_filter,
     date_to_apple_ns,
+    fetch_media,
     fetch_messages,
     fetch_messages_around,
     get_conn,
+    has_media_neighbor,
     has_neighbor,
+    media_count,
+    media_date_bounds,
     live_db_error,
     merged_chat_ids,
     load_attachments,
@@ -938,16 +942,7 @@ def media_size_seg_html():
     return f'<div class="seg seg-sm" id="mediaSize" role="radiogroup" aria-label="Tile size">{btns}</div>'
 
 
-def media_start_script():
-    if load_prefs()["start"] != START_NEWEST:
-        return ""
-    return (
-        "<script>function goEnd(){window.scrollTo(0,document.documentElement.scrollHeight)}"
-        "goEnd();window.addEventListener('load',goEnd);</script>"
-    )
-
-
-def media_sections_html(items, empty_msg):
+def media_sections_html(items, empty_msg=""):
     """items is a list of (ym, tile_html) in chronological order."""
     sections = []
     cur_ym = None
@@ -962,21 +957,126 @@ def media_sections_html(items, empty_msg):
     if tiles:
         sections.append((cur_ym, tiles))
     if not sections:
-        return f'<p class="empty">{empty_msg}</p>', ""
-    section_html = "".join(
-        f'<section class="media-month" data-year="{ym[:4]}" data-label="{month_label(ym)}">'
+        return f'<p class="empty">{empty_msg}</p>' if empty_msg else ""
+    return "".join(
+        f'<section class="media-month" data-year="{ym[:4]}" data-month="{ym}" data-label="{month_label(ym)}">'
         f'<h3 class="media-month-h">{month_label(ym)}</h3>'
         f'<div class="mediagrid">{"".join(tile_htmls)}</div></section>'
         for ym, tile_htmls in sections
     )
-    rail_html = """<div class="media-rail" id="mediaRail">
+
+
+def media_rail_html(min_date, max_date, jump_path):
+    if not min_date or not max_date:
+        return ""
+    return f"""<div class="media-rail" id="mediaRail" data-min="{min_date}" data-max="{max_date}" data-jump="{html.escape(jump_path)}">
 <div class="media-rail-track" id="mediaRailTrack"><div class="media-rail-dot" id="mediaRailDot"></div></div>
 <div class="media-rail-label" id="mediaRailLabel"></div>
 </div>"""
-    return section_html, rail_html
 
 
-def render_media(chat_id):
+def media_items(rows, *, chat_id=None, labels=None, visual_only=False):
+    items = []
+    seen = set()
+    for a in rows:
+        if a["att_id"] in seen:
+            continue
+        seen.add(a["att_id"])
+        cid = chat_id if chat_id is not None else a["chat_id"]
+        name = (labels or {}).get(cid)
+        ym, tile = media_tile_html(a, cid, chat_name=name, visual_only=visual_only)
+        if tile:
+            items.append((ym, tile))
+    return items
+
+
+def _media_page(chat_id, date_str, visual_only, empty_msg, more_url, jump_path):
+    conn = get_conn()
+    jump_to_end = False
+    start_ns = None
+    if date_str:
+        try:
+            start_ns = date_to_apple_ns(date_str)
+        except ValueError:
+            start_ns = None
+    if start_ns is None and load_prefs()["start"] == START_NEWEST:
+        rows = fetch_media(
+            conn, chat_id, from_end=True, limit=MEDIA_PAGE_SIZE, visual_only=visual_only
+        )
+        jump_to_end = True
+    else:
+        rows = fetch_media(
+            conn, chat_id, start_ns=start_ns, limit=MEDIA_PAGE_SIZE, visual_only=visual_only
+        )
+    labels = None
+    if chat_id is None:
+        labels = load_chat_labels(conn, [a["chat_id"] for a in rows])
+    items = media_items(rows, chat_id=chat_id, labels=labels, visual_only=visual_only)
+    bounds = media_date_bounds(conn, chat_id, visual_only)
+    total = media_count(conn, chat_id, visual_only)
+    has_older = has_newer = False
+    if rows:
+        has_older = has_media_neighbor(
+            conn, rows[0]["date"], rows[0]["att_id"], "before", chat_id, visual_only
+        )
+        has_newer = has_media_neighbor(
+            conn, rows[-1]["date"], rows[-1]["att_id"], "after", chat_id, visual_only
+        )
+    conn.close()
+    min_date = apple_date(bounds["lo"])[:10] if bounds and bounds["lo"] else ""
+    max_date = apple_date(bounds["hi"])[:10] if bounds and bounds["hi"] else ""
+    first_id = rows[0]["att_id"] if rows else 0
+    first_date = str(rows[0]["date"]) if rows else "0"
+    last_id = rows[-1]["att_id"] if rows else 0
+    last_date = str(rows[-1]["date"]) if rows else "0"
+    if not items:
+        body = f'<main class="page"><p class="empty">{empty_msg}</p></main>'
+        return body, total
+    sections = media_sections_html(items)
+    body = f"""<main class="page">
+<div id="mediaSentinelTop"></div>
+<div id="mediaStream" data-more="{html.escape(more_url)}" data-first-date="{first_date}" data-first-id="{first_id}" data-last-date="{last_date}" data-last-id="{last_id}" data-has-older="{1 if has_older else 0}" data-has-newer="{1 if has_newer else 0}" data-jump-end="{1 if jump_to_end else 0}">{sections}</div>
+<div id="mediaSentinel"></div>
+</main>
+{media_rail_html(min_date, max_date, jump_path)}"""
+    return body, total
+
+
+def render_media_more(chat_id, after=None, before=None):
+    visual_only = chat_id is None
+    conn = get_conn()
+    if before is not None:
+        rows = fetch_media(
+            conn, chat_id, before=before, limit=MEDIA_PAGE_SIZE, visual_only=visual_only
+        )
+        has_more_older = len(rows) == MEDIA_PAGE_SIZE
+        has_more_newer = True
+    elif after is not None:
+        rows = fetch_media(
+            conn, chat_id, after=after, limit=MEDIA_PAGE_SIZE, visual_only=visual_only
+        )
+        has_more_newer = len(rows) == MEDIA_PAGE_SIZE
+        has_more_older = True
+    else:
+        conn.close()
+        return None
+    labels = None
+    if chat_id is None:
+        labels = load_chat_labels(conn, [a["chat_id"] for a in rows])
+    items = media_items(rows, chat_id=chat_id, labels=labels, visual_only=visual_only)
+    conn.close()
+    return {
+        "html": media_sections_html(items),
+        "first_id": rows[0]["att_id"] if rows else 0,
+        "first_date": str(rows[0]["date"]) if rows else "0",
+        "last_id": rows[-1]["att_id"] if rows else 0,
+        "last_date": str(rows[-1]["date"]) if rows else "0",
+        "has_more_older": has_more_older,
+        "has_more_newer": has_more_newer,
+    }
+
+
+def render_media(chat_id, date_str=None):
     conn = get_conn()
     chat = conn.execute(
         "SELECT ROWID as id, chat_identifier, display_name FROM chat WHERE ROWID=?", (chat_id,)
@@ -984,93 +1084,47 @@ def render_media(chat_id):
     if not chat:
         conn.close()
         return None
-
-    chat_sql, chat_params = chat_filter(conn, chat_id)
-    media = conn.execute(
-        f"""SELECT att.ROWID as att_id, att.mime_type, att.filename, m.ROWID as msg_id, m.date
-           FROM message_attachment_join maj
-           JOIN attachment att ON att.ROWID = maj.attachment_id
-           JOIN message m ON m.ROWID = maj.message_id
-           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-           WHERE {chat_sql} AND att.filename NOT LIKE '%.pluginPayloadAttachment'
-           ORDER BY m.date ASC, m.ROWID ASC""",
-        chat_params,
-    ).fetchall()
-
     participants = None
     if not chat["display_name"] and not resolve_contact(chat["chat_identifier"]):
         participants = load_participants(conn, [chat_id]).get(chat_id)
     title = chat_label(chat["display_name"], chat["chat_identifier"], participants)
     conn.close()
 
-    items = []
-    for a in media:
-        ym, tile = media_tile_html(a, chat_id)
-        if tile:
-            items.append((ym, tile))
-    section_html, rail_html = media_sections_html(items, "No photos or files in this conversation.")
-
+    body, total = _media_page(
+        chat_id,
+        date_str,
+        False,
+        "No photos or files in this conversation.",
+        f"/chat/{chat_id}/media/more",
+        f"/chat/{chat_id}/media",
+    )
     header_left = (
         f'<a class="back" href="/chat/{chat_id}">← {html.escape(title)}</a>'
         f'<b>Photos</b>'
     )
     return page(
         f"Photos: {title}",
-        f'<main class="page">{section_html}</main>{rail_html}',
+        body,
         header_left=header_left,
         header_right=(
             f'{media_size_seg_html()}<a class="btn btn-ghost" href="/media">All photos</a>'
-            f'<span class="muted">{len(items):,} items</span>'
+            f'<span class="muted">{total:,} items</span>'
         ),
         body_class="mediapage",
-        scripts=media_start_script(),
         chat_id=chat_id,
     )
 
 
-def render_all_media():
-    conn = get_conn()
-    media = conn.execute(
-        """SELECT att.ROWID as att_id, att.mime_type, att.filename, m.ROWID as msg_id, m.date,
-                  cmj.chat_id as chat_id
-           FROM message_attachment_join maj
-           JOIN attachment att ON att.ROWID = maj.attachment_id
-           JOIN message m ON m.ROWID = maj.message_id
-           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-           WHERE att.filename NOT LIKE '%.pluginPayloadAttachment'
-             AND (
-               ifnull(att.mime_type, '') LIKE 'image/%'
-               OR ifnull(att.mime_type, '') LIKE 'video/%'
-               OR lower(ifnull(att.filename, '')) LIKE '%.heic'
-               OR lower(ifnull(att.filename, '')) LIKE '%.heif'
-               OR lower(ifnull(att.filename, '')) LIKE '%.mov'
-               OR lower(ifnull(att.filename, '')) LIKE '%.mp4'
-             )
-           ORDER BY m.date ASC, m.ROWID ASC"""
-    ).fetchall()
-    labels = load_chat_labels(conn, [a["chat_id"] for a in media])
-    conn.close()
-
-    seen = set()
-    items = []
-    for a in media:
-        if a["att_id"] in seen:
-            continue
-        seen.add(a["att_id"])
-        ym, tile = media_tile_html(
-            a, a["chat_id"], chat_name=labels.get(a["chat_id"]), visual_only=True
-        )
-        if tile:
-            items.append((ym, tile))
-
-    section_html, rail_html = media_sections_html(items, "No photos or videos yet.")
+def render_all_media(date_str=None):
+    body, total = _media_page(
+        None, date_str, True, "No photos or videos yet.", "/media/more", "/media"
+    )
     return page(
         "Photos",
-        f'<main class="page">{section_html}</main>{rail_html}',
+        body,
         active="photos",
-        header_right=f'{media_size_seg_html()}<span class="muted">{len(items):,} items</span>',
+        header_right=f'{media_size_seg_html()}<span class="muted">{total:,} items</span>',
         body_class="mediapage",
-        scripts=media_start_script(),
     )
 
 
