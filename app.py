@@ -53,6 +53,7 @@ from db import (
 from render import (
     render_all_media,
     render_chat,
+    render_chat_heatmap,
     render_chat_list,
     render_db_error,
     render_media,
@@ -95,11 +96,12 @@ def convert_heic(path):
     return out_path
 
 
-def make_thumb(path):
+def make_thumb(path, dest=None):
     """Max-edge 512px JPEG for chat bubbles and the media grid. Lightbox still
     uses the original via /attachment."""
-    digest = hashlib.sha1(f"thumb{THUMB_SIZE}:{path}".encode()).hexdigest()
-    out_path = os.path.join(CACHE_DIR, digest + ".jpg")
+    out_path = dest or os.path.join(
+        CACHE_DIR, hashlib.sha1(f"thumb{THUMB_SIZE}:{path}".encode()).hexdigest() + ".jpg"
+    )
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return out_path
     result = subprocess.run(
@@ -238,6 +240,17 @@ class Handler(BaseHTTPRequestHandler):
             around_id = int(around) if around and around.isdigit() else None
             out = render_chat(chat_id, date_str, around_id)
             self._send_html(out) if out is not None else self._send_error(404)
+        elif parts[0] == "chat" and len(parts) == 3 and parts[2] == "heatmap":
+            try:
+                chat_id = int(parts[1])
+            except ValueError:
+                self._send_error(404)
+                return
+            out = render_chat_heatmap(chat_id)
+            if out is None:
+                self._send_error(404)
+                return
+            self._send_html(out)
         elif parts[0] == "chat" and len(parts) == 3 and parts[2] == "more":
             self._serve_more(parts[1], qs)
         elif parts[0] == "chat" and len(parts) == 3 and parts[2] == "media":
@@ -414,6 +427,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _serve_thumb(self, att_id):
+        try:
+            att_id_int = int(att_id)
+        except ValueError:
+            self._send_error(404)
+            return
+        cached = os.path.join(CACHE_DIR, f"thumb{THUMB_SIZE}-{att_id_int}.jpg")
+        if os.path.exists(cached) and os.path.getsize(cached) > 0:
+            self._send_file(cached, "image/jpeg")
+            return
         info = self._attachment_path(att_id)
         if not info:
             self._send_error(404)
@@ -422,7 +444,11 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.exists(path):
             self._send_error(404)
             return
-        thumb = make_thumb(path) if mime.startswith("image/") or is_heic(path, mime) else None
+        thumb = (
+            make_thumb(path, cached)
+            if mime.startswith("image/") or is_heic(path, mime)
+            else None
+        )
         if thumb:
             self._send_file(thumb, "image/jpeg")
             return

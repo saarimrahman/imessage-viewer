@@ -173,6 +173,24 @@ def chat_filter(conn, chat_id, alias="cmj"):
     return f"{alias}.chat_id IN ({','.join('?' * len(chat_ids))})", list(chat_ids)
 
 
+# Group tapbacks store the participant index in the guid prefix (`p:0/…`,
+# `p:3/…`). 32 covers an iMessage group at the usual size limit.
+REACTION_GUID_PREFIXES = 32
+
+
+def reaction_lookup_keys(guids):
+    """Bare guid plus `p:N/guid` so the associated_message_guid index can hit."""
+    keys = []
+    seen = set()
+    for guid in guids:
+        if not guid or guid in seen:
+            continue
+        seen.add(guid)
+        keys.append(guid)
+        keys.extend(f"p:{i}/{guid}" for i in range(REACTION_GUID_PREFIXES))
+    return keys
+
+
 def load_reactions(conn, chat_id, guids):
     """Tapbacks are stored as their own message rows pointing at a target guid
     via associated_message_guid. A later 3xxx-type row for the same
@@ -181,16 +199,24 @@ def load_reactions(conn, chat_id, guids):
     if not guids:
         return {}
     guid_set = set(guids)
+    keys = reaction_lookup_keys(guid_set)
+    if not keys:
+        return {}
     chat_sql, chat_params = chat_filter(conn, chat_id)
+    qmarks = ",".join("?" * len(keys))
     rows = conn.execute(
         f"""SELECT m.associated_message_guid, m.associated_message_type, m.associated_message_emoji,
                   m.is_from_me, m.date, h.id as handle
            FROM message m
-           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
            LEFT JOIN handle h ON h.ROWID = m.handle_id
-           WHERE {chat_sql} AND m.associated_message_type BETWEEN 2000 AND 3999
+           WHERE m.associated_message_type BETWEEN 2000 AND 3999
+             AND m.associated_message_guid IN ({qmarks})
+             AND EXISTS (
+               SELECT 1 FROM chat_message_join cmj
+               WHERE cmj.message_id = m.ROWID AND {chat_sql}
+             )
            ORDER BY m.date ASC""",
-        chat_params,
+        keys + chat_params,
     ).fetchall()
 
     state = {}
@@ -213,10 +239,20 @@ def load_reactions(conn, chat_id, guids):
     return out
 
 
+# Start from chat_message_join so ORDER BY message_date can use
+# chat_message_join_idx_message_date_id_chat_id instead of sorting the thread.
 MSG_SELECT = """SELECT m.ROWID as id, m.guid, m.text, m.attributedBody, m.date, m.is_from_me, h.id as handle
-            FROM message m
-            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            FROM chat_message_join cmj
+            JOIN message m ON m.ROWID = cmj.message_id
             LEFT JOIN handle h ON h.ROWID = m.handle_id"""
+
+
+def _cmj_cursor(date_op, id_op=None):
+    id_op = id_op or date_op
+    return (
+        f"(cmj.message_date {date_op} ? OR "
+        f"(cmj.message_date = ? AND cmj.message_id {id_op} ?))"
+    )
 
 
 def fetch_messages(conn, chat_id, after=None, before=None, start_ns=None, limit=PAGE_SIZE, from_end=False):
@@ -224,21 +260,21 @@ def fetch_messages(conn, chat_id, after=None, before=None, start_ns=None, limit=
     chat_sql, chat_params = chat_filter(conn, chat_id)
     where = [chat_sql, REACTION_EXCLUDE_SQL]
     params = list(chat_params)
-    order = "m.date ASC, m.ROWID ASC"
+    order = "cmj.message_date ASC, cmj.message_id ASC"
     if after:
         date_ns, rowid = after
-        where.append("(m.date > ? OR (m.date = ? AND m.ROWID > ?))")
+        where.append(_cmj_cursor(">"))
         params.extend([date_ns, date_ns, rowid])
     elif before:
         date_ns, rowid = before
-        where.append("(m.date < ? OR (m.date = ? AND m.ROWID < ?))")
+        where.append(_cmj_cursor("<"))
         params.extend([date_ns, date_ns, rowid])
-        order = "m.date DESC, m.ROWID DESC"
+        order = "cmj.message_date DESC, cmj.message_id DESC"
     elif start_ns is not None:
-        where.append("m.date >= ?")
+        where.append("cmj.message_date >= ?")
         params.append(start_ns)
     elif from_end:
-        order = "m.date DESC, m.ROWID DESC"
+        order = "cmj.message_date DESC, cmj.message_id DESC"
     rows = conn.execute(
         f"{MSG_SELECT} WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?",
         params + [limit],
@@ -260,16 +296,25 @@ def sender_context(conn, rowid):
 
 
 def has_neighbor(conn, chat_id, date_ns, rowid, direction):
-    if direction == "before":
-        clause = "(m.date < ? OR (m.date = ? AND m.ROWID < ?))"
-    else:
-        clause = "(m.date > ? OR (m.date = ? AND m.ROWID > ?))"
+    clause = _cmj_cursor("<" if direction == "before" else ">")
     chat_sql, chat_params = chat_filter(conn, chat_id)
     return conn.execute(
-        f"""SELECT 1 FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+        f"""SELECT 1 FROM chat_message_join cmj
+            JOIN message m ON m.ROWID = cmj.message_id
             WHERE {chat_sql} AND {REACTION_EXCLUDE_SQL} AND {clause} LIMIT 1""",
         chat_params + [date_ns, date_ns, rowid],
     ).fetchone() is not None
+
+
+def chat_date_bounds(conn, chat_id):
+    """First and last message_date in the merged thread. Uses the join table
+    so a long chat does not have to touch every `message` row."""
+    chat_sql, chat_params = chat_filter(conn, chat_id)
+    return conn.execute(
+        f"SELECT min(cmj.message_date) as lo, max(cmj.message_date) as hi "
+        f"FROM chat_message_join cmj WHERE {chat_sql}",
+        chat_params,
+    ).fetchone()
 
 
 def load_attachments(conn, message_ids):
@@ -296,14 +341,14 @@ def fetch_messages_around(conn, chat_id, target_id, half=75):
     chat_sql, chat_params = chat_filter(conn, chat_id)
     before_rows = conn.execute(
         f"""{MSG_SELECT}
-           WHERE {chat_sql} AND (m.date < ? OR (m.date = ? AND m.ROWID <= ?)) AND {REACTION_EXCLUDE_SQL}
-           ORDER BY m.date DESC, m.ROWID DESC LIMIT ?""",
+           WHERE {chat_sql} AND {_cmj_cursor("<", "<=")} AND {REACTION_EXCLUDE_SQL}
+           ORDER BY cmj.message_date DESC, cmj.message_id DESC LIMIT ?""",
         chat_params + [tgt_date, tgt_date, target_id, half],
     ).fetchall()
     after_rows = conn.execute(
         f"""{MSG_SELECT}
-           WHERE {chat_sql} AND (m.date > ? OR (m.date = ? AND m.ROWID > ?)) AND {REACTION_EXCLUDE_SQL}
-           ORDER BY m.date ASC, m.ROWID ASC LIMIT ?""",
+           WHERE {chat_sql} AND {_cmj_cursor(">")} AND {REACTION_EXCLUDE_SQL}
+           ORDER BY cmj.message_date ASC, cmj.message_id ASC LIMIT ?""",
         chat_params + [tgt_date, tgt_date, target_id, half],
     ).fetchall()
     return list(reversed(before_rows)) + list(after_rows)

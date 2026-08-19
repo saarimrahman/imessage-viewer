@@ -140,6 +140,27 @@
     wrap.scrollLeft += r.left + r.width / 2 - (w.left + w.width / 2);
   }
 
+  function initChatHeatmap() {
+    const slot = document.getElementById("heatmapSlot");
+    if (!slot || !slot.dataset.chatId) return;
+    fetch("/chat/" + slot.dataset.chatId + "/heatmap")
+      .then((res) => (res.ok ? res.text() : ""))
+      .then((html) => {
+        slot.classList.remove("is-loading");
+        if (!html) {
+          slot.remove();
+          return;
+        }
+        slot.innerHTML = html;
+        initHeatMode();
+        initHeatmapFocus();
+      })
+      .catch(() => {
+        slot.classList.remove("is-loading");
+        slot.remove();
+      });
+  }
+
   function initCountup() {
     document.querySelectorAll(".countup").forEach((el) => {
       const target = parseFloat(el.dataset.count);
@@ -2283,6 +2304,7 @@
   initDatepicker();
   initHeatMode();
   initHeatmapFocus();
+  initChatHeatmap();
   initCountup();
   initTileDurations();
   initMediaSize();

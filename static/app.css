@@ -946,6 +946,16 @@ a.att-file {
 
 /* ——— Heatmap ——— */
 
+.heatmap-slot {
+  margin-bottom: 16px;
+}
+.heatmap-slot.is-loading {
+  min-height: 148px;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+}
+.heatmap-slot .heatmap-card { margin-bottom: 0; }
+
 .heatmap-card {
   background: var(--surface);
   border-radius: var(--radius-lg);

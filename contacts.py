@@ -135,7 +135,7 @@ AVATAR_COLORS = ["#ff9500", "#ff3b30", "#af52de", "#5856d6", "#007aff", "#34c759
 def avatar_html(name, identifier=None):
     aid = avatar_id(identifier)
     if aid:
-        return f'<img class="avatar" src="/avatar/{aid}">'
+        return f'<img class="avatar" src="/avatar/{aid}" loading="lazy" decoding="async">'
     initial = (name or "?").strip()[:1].upper() or "?"
     color = AVATAR_COLORS[sum(ord(c) for c in (name or "")) % len(AVATAR_COLORS)]
     return f'<span class="avatar" style="background:{color}">{html.escape(initial)}</span>'

@@ -20,6 +20,7 @@ from db import (
     REACTION_EXCLUDE_SQL,
     REACTION_LABELS,
     apple_date,
+    chat_date_bounds,
     chat_filter,
     date_to_apple_ns,
     fetch_messages,
@@ -359,10 +360,13 @@ def render_message_blocks(
             if mime.startswith("image/") or is_heic(a["filename"] or "", mime):
                 body += (
                     f'<img class="att" src="/thumb/{a["att_id"]}" '
-                    f'data-full-src="/attachment/{a["att_id"]}" loading="lazy" data-msg-id="{r["id"]}">'
+                    f'data-full-src="/attachment/{a["att_id"]}" loading="lazy" decoding="async" data-msg-id="{r["id"]}">'
                 )
             elif mime.startswith("video/"):
-                body += f'<video class="att" src="/attachment/{a["att_id"]}" controls data-msg-id="{r["id"]}"></video>'
+                body += (
+                    f'<video class="att" src="/attachment/{a["att_id"]}" controls '
+                    f'preload="none" data-msg-id="{r["id"]}"></video>'
+                )
             else:
                 fname = html.escape(os.path.basename(a["filename"] or "file"))
                 body += f'<a class="att-file" href="/attachment/{a["att_id"]}">{fname}</a>'
@@ -538,11 +542,14 @@ def render_chat_list(sort="recent"):
     conn = get_conn()
     rows = conn.execute(
         """SELECT c.ROWID as id, c.chat_identifier, c.display_name,
-                  count(m.ROWID) as msg_count, max(m.date) as last_date, min(m.date) as first_date
+                  s.n as msg_count, s.last_date as last_date, s.first_date as first_date
            FROM chat c
-           JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
-           JOIN message m ON m.ROWID = cmj.message_id
-           GROUP BY c.ROWID"""
+           JOIN (
+             SELECT chat_id, count(*) AS n,
+                    max(message_date) AS last_date, min(message_date) AS first_date
+             FROM chat_message_join
+             GROUP BY chat_id
+           ) s ON s.chat_id = c.ROWID"""
     ).fetchall()
 
     need_participants = [
@@ -634,11 +641,7 @@ def render_chat(chat_id, date_str=None, around_id=None):
         return None
 
     chat_sql, chat_params = chat_filter(conn, chat_id)
-    bounds = conn.execute(
-        f"""SELECT min(m.date) as lo, max(m.date) as hi FROM message m
-           JOIN chat_message_join cmj ON cmj.message_id = m.ROWID WHERE {chat_sql}""",
-        chat_params,
-    ).fetchone()
+    bounds = chat_date_bounds(conn, chat_id)
     media_count = conn.execute(
         f"""SELECT count(*) FROM message_attachment_join maj
            JOIN chat_message_join cmj ON cmj.message_id = maj.message_id
@@ -668,7 +671,6 @@ def render_chat(chat_id, date_str=None, around_id=None):
     att_by_msg = load_attachments(conn, ids)
     reactions_by_guid = load_reactions(conn, chat_id, [r["guid"] for r in rows])
     blocks_html = render_message_blocks(rows, att_by_msg, reactions_by_guid, highlight_id=around_id)
-    heatmap_html = build_heatmap_html(conn, chat_id)
 
     has_older = has_newer = False
     if rows:
@@ -708,7 +710,7 @@ def render_chat(chat_id, date_str=None, around_id=None):
 </div>"""
 
     body = f"""<main class="page">
-{heatmap_html}
+<div class="heatmap-slot is-loading" id="heatmapSlot" data-chat-id="{chat_id}"></div>
 <div id="sentinel-top">{top_label}</div>
 <div class="bubblewrap" id="messages">{blocks_html}</div>
 <div id="sentinel">{bottom_label}</div>
@@ -853,7 +855,7 @@ if (aroundId) {{
     jumpToEnd();
     window.addEventListener('load', jumpToEnd);
   }}
-  armObservers();
+  requestAnimationFrame(() => requestAnimationFrame(armObservers));
 }}
 </script>"""
     return page(
@@ -865,6 +867,19 @@ if (aroundId) {{
         scripts=scripts,
         chat_id=chat_id,
     )
+
+
+def render_chat_heatmap(chat_id):
+    """HTML fragment for the conversation heatmap. Loaded after the thread so
+    the first paint is not blocked on a full-history GROUP BY."""
+    conn = get_conn()
+    chat = conn.execute("SELECT ROWID FROM chat WHERE ROWID=?", (chat_id,)).fetchone()
+    if not chat:
+        conn.close()
+        return None
+    html = build_heatmap_html(conn, chat_id)
+    conn.close()
+    return html
 
 
 def month_label(ym):
@@ -891,7 +906,7 @@ def media_tile_html(a, chat_id, chat_name=None, visual_only=False):
     when = apple_date(a["date"])
     title = f"{chat_name} · {when}" if chat_name else when
     if is_image:
-        inner = f'<img src="/thumb/{a["att_id"]}" data-full-src="/attachment/{a["att_id"]}" loading="lazy">'
+        inner = f'<img src="/thumb/{a["att_id"]}" data-full-src="/attachment/{a["att_id"]}" loading="lazy" decoding="async">'
     elif is_video:
         inner = (
             f'<video src="/attachment/{a["att_id"]}" preload="metadata" muted></video>'
